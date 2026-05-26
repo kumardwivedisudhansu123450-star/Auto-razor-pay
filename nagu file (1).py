@@ -824,7 +824,6 @@ async def log_hit(ctx: ContextTypes.DEFAULT_TYPE, hit_type: str,
             text = (
                 f"{e('charged')} <b>CHARGED</b> — {ulink}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{e('card')}  CC:  <code>{cc_mask}</code> | {mm}/{yy}\n"
                 f"{e('bin')}   BIN: <code>{bin6}</code> · {net}\n"
                 f"{e('coin')}  Amt: <b>₹{amount_inr}</b>\n"
                 f"{e('gate')}  Resp: <code>{safe(response[:70])}</code>\n"
@@ -837,7 +836,6 @@ async def log_hit(ctx: ContextTypes.DEFAULT_TYPE, hit_type: str,
             text = (
                 f"{e('approved')} <b>APPROVED</b> — {ulink}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{e('card')}  CC:  <code>{cc_mask}</code> | {mm}/{yy}\n"
                 f"{e('bin')}   BIN: <code>{bin6}</code> · {net}\n"
                 f"{e('bolt')}  Resp: <code>{safe(response[:70])}</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
